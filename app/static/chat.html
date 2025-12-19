@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>校园信息智能问答（RAG）</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="container">
+    <h1>校园信息智能问答（RAG）</h1>
+    <div class="subtitle">学生端 · 提问查询，自动引用索引文档。</div>
+
+    <div class="card">
+      <h3>提问</h3>
+      <textarea id="query" placeholder="输入你的问题，例如：请假申请需要哪些材料？"></textarea>
+      <div class="controls">
+        <label>Top-K: <input type="number" id="topk" value="4" min="1" max="10" style="width:60px;" /></label>
+        <label><input type="checkbox" id="needTool" checked /> 允许工具调用</label>
+        <label><input type="checkbox" id="streaming" /> 流式输出</label>
+        <button onclick="ask()">提问</button>
+      </div>
+    </div>
+
+    <div id="result"></div>
+  </div>
+
+  <!-- 首次登录修改密码弹窗 -->
+  <div id="pwdModal" class="modal hidden">
+    <div class="modal-backdrop" onclick="closePwdModal()"></div>
+    <div class="modal-content">
+      <h3>首次登录请修改密码</h3>
+      <p class="muted">为了保障账号安全，请设置一个新的登录密码。</p>
+      <input type="password" id="modalNewPwd" class="input" placeholder="新密码（至少6位）" style="width:100%; margin-top:10px;" />
+      <input type="password" id="modalConfirmPwd" class="input" placeholder="确认新密码" style="width:100%; margin-top:10px;" />
+      <div id="modalPwdStatus" class="sources" style="margin-top:8px;"></div>
+      <div class="modal-actions">
+        <button class="secondary" onclick="closePwdModal()">取消</button>
+        <button onclick="changePasswordFromModal()">确定修改</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/chat.js"></script>
+</body>
+</html>

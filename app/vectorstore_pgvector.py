@@ -1,0 +1,142 @@
+from __future__ import annotations
+
+import json
+from typing import List, Tuple
+import logging
+
+import numpy as np
+import psycopg2
+from psycopg2 import errors
+from pgvector.psycopg2 import register_vector
+from psycopg2.extras import execute_values
+
+from .config import get_settings, Settings
+from .models import DocumentChunk, RetrievedChunk
+from .embedding_provider import EmbeddingProvider
+
+
+logger = logging.getLogger(__name__)
+
+
+class PGVectorStore:
+    def __init__(self, settings: Settings | None = None):
+        self.settings = settings or get_settings()
+        if not self.settings.pg_dsn:
+            raise RuntimeError("PgVector enabled but CAMPUS_RAG_PG_DSN not configured")
+        self.embedder = EmbeddingProvider(self.settings)
+        self.table = self.settings.pg_table
+
+    def _connect(self):
+        conn = psycopg2.connect(self.settings.pg_dsn)
+        register_vector(conn)
+        return conn
+
+    def _ensure_schema(self, dim: int):
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {self.table} (
+                    chunk_id TEXT PRIMARY KEY,
+                    document_id TEXT,
+                    source TEXT,
+                    source_type TEXT,
+                    metadata JSONB,
+                    content TEXT,
+                    embedding vector({dim})
+                )
+                """
+            )
+            conn.commit()
+
+    def _embed(self, texts: List[str]) -> np.ndarray:
+        return self.embedder.embed(texts)
+
+    def build(self, chunks: List[DocumentChunk]):
+        if not chunks:
+            return
+        embeddings = self._embed([c.text for c in chunks])
+        dim = embeddings.shape[1]
+        self._ensure_schema(dim)
+
+        rows = []
+        for ch, emb in zip(chunks, embeddings):
+            rows.append(
+                (
+                    ch.id,
+                    ch.source,
+                    ch.source,
+                    ch.source_type,
+                    json.dumps(ch.metadata or {}),
+                    ch.text,
+                    emb.tolist(),
+                )
+            )
+
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(f"TRUNCATE TABLE {self.table}")
+            execute_values(
+                cur,
+                f"""
+                INSERT INTO {self.table}
+                (chunk_id, document_id, source, source_type, metadata, content, embedding)
+                VALUES %s
+                ON CONFLICT (chunk_id) DO UPDATE SET
+                    document_id=EXCLUDED.document_id,
+                    source=EXCLUDED.source,
+                    source_type=EXCLUDED.source_type,
+                    metadata=EXCLUDED.metadata,
+                    content=EXCLUDED.content,
+                    embedding=EXCLUDED.embedding
+                """,
+                rows,
+                template="(%s,%s,%s,%s,%s,%s,%s)"
+            )
+            conn.commit()
+
+    def search(self, query: str, top_k: int) -> List[RetrievedChunk]:
+        q_emb = self._embed([query])[0].tolist()
+        self._ensure_schema(len(q_emb))
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT chunk_id, document_id, source, source_type, metadata, content,
+                       (embedding <=> %s)::float AS distance
+                FROM {self.table}
+                ORDER BY embedding <=> %s
+                LIMIT %s
+                """,
+                (q_emb, q_emb, top_k),
+            )
+            rows = cur.fetchall()
+
+        hits: List[RetrievedChunk] = []
+        for row in rows:
+            chunk_id, document_id, source, source_type, metadata, content, distance = row
+            meta_obj = metadata or {}
+            if isinstance(meta_obj, str):
+                try:
+                    meta_obj = json.loads(meta_obj)
+                except Exception:
+                    meta_obj = {"raw_metadata": meta_obj}
+            chunk = DocumentChunk(
+                id=chunk_id,
+                text=content,
+                source=source,
+                source_type=source_type or "file",
+                url=None,
+                metadata=meta_obj,
+            )
+            score = float(1.0 - distance)  # cosine 距离越小越好，转为相似度
+            hits.append(RetrievedChunk(chunk=chunk, score=score))
+        return hits
+
+    def stats(self) -> Tuple[int, int]:
+        try:
+            with self._connect() as conn, conn.cursor() as cur:
+                cur.execute(f"SELECT COUNT(*) FROM {self.table}")
+                count = cur.fetchone()[0]
+            return int(count), int(count)
+        except errors.UndefinedTable:
+            logger.warning("PgVector table '%s' missing; returning empty stats", self.table)
+            return 0, 0

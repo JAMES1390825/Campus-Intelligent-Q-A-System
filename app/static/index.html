@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>校园信息智能问答（RAG）</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="container">
+    <h1>校园信息智能问答（RAG）</h1>
+    <div class="subtitle">学生端 · 登录后即可进行提问。</div>
+
+    <div class="card">
+      <h3>登录</h3>
+      <div class="controls">
+        <input type="text" id="username" class="input" placeholder="学号 / 账号" style="width:220px;" />
+        <input type="password" id="password" class="input" placeholder="密码" style="width:220px;" />
+      </div>
+      <div class="controls" style="margin-top:12px;">
+        <button onclick="login()">登录</button>
+        <span id="loginStatus" class="sources"></span>
+      </div>
+      <div class="sources" style="margin-top:8px;">首次登录默认密码：hziee+学号，登录后会提示修改。</div>
+      <div class="sources" style="margin-top:6px;">管理员入口：<a href="/admin">/admin</a></div>
+    </div>
+  </div>
+  <script src="/static/login.js"></script>
+</body>
+</html>

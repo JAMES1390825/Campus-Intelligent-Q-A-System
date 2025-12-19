@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>校园信息问答 · 管理端</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="container">
+    <h1>管理端 · 文档上传</h1>
+    <div class="subtitle">仅管理员可上传/重建索引，学生端请访问 /</div>
+
+    <div class="card">
+      <h3>登录</h3>
+      <div class="row">
+        <input id="adminUsername" type="text" class="input" placeholder="管理员账号" value="admin" />
+        <input id="adminPassword" type="password" class="input" placeholder="管理员密码" />
+        <button onclick="login()">登录</button>
+        <span id="loginStatus" class="sources"></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>上传文档（仅支持 .txt）</h3>
+      <div class="upload-area">
+        <input type="file" id="fileInput" accept="text/plain" />
+        <button onclick="uploadDoc()">上传并重建索引</button>
+        <div id="uploadStatus" class="sources"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>批量注册学生账号</h3>
+      <div class="controls" style="flex-direction: column; align-items: flex-start; gap:10px;">
+        <textarea id="studentIds" placeholder="每行一个学号"></textarea>
+        <button onclick="batchRegister()">批量注册</button>
+        <div id="registerStatus" class="sources"></div>
+      </div>
+    </div>
+  </div>
+  <script src="/static/admin.js"></script>
+</body>
+</html>
