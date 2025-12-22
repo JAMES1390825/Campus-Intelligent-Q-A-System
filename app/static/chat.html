@@ -41,5 +41,17 @@
   </div>
 
   <script src="/static/chat.js"></script>
+
+  <div id="docPreviewModal" class="modal hidden">
+    <div class="modal-backdrop" onclick="closeDocPreview()"></div>
+    <div class="modal-content">
+      <h3 id="docPreviewTitle"></h3>
+      <pre id="docPreviewBody" class="modal-body" style="max-height:50vh; white-space:pre-wrap;"></pre>
+      <div class="modal-actions">
+        <button onclick="downloadDoc()">下载原文件</button>
+        <button class="secondary" onclick="closeDocPreview()">关闭</button>
+      </div>
+    </div>
+  </div>
 </body>
 </html>

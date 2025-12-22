@@ -11,22 +11,18 @@
     <div class="subtitle">仅管理员可上传/重建索引，学生端请访问 /</div>
 
     <div class="card">
-      <h3>登录</h3>
-      <div class="row">
-        <input id="adminUsername" type="text" class="input" placeholder="管理员账号" value="admin" />
-        <input id="adminPassword" type="password" class="input" placeholder="管理员密码" />
-        <button onclick="login()">登录</button>
-        <span id="loginStatus" class="sources"></span>
+      <h3>上传文档（支持 .txt/.md/.pdf/.docx/.xlsx）</h3>
+      <div class="upload-area">
+        <input type="file" id="fileInput" accept=".txt,.md,.pdf,.docx,.xlsx" />
+        <button onclick="uploadDoc()">上传并重建索引</button>
+        <div id="uploadStatus" class="sources"></div>
       </div>
     </div>
 
     <div class="card">
-      <h3>上传文档（仅支持 .txt）</h3>
-      <div class="upload-area">
-        <input type="file" id="fileInput" accept="text/plain" />
-        <button onclick="uploadDoc()">上传并重建索引</button>
-        <div id="uploadStatus" class="sources"></div>
-      </div>
+      <h3>已上传文档</h3>
+      <div class="sources" style="margin-bottom:8px;">点击文件名可预览原文。</div>
+      <div id="docsList" class="list"></div>
     </div>
 
     <div class="card">
@@ -35,6 +31,34 @@
         <textarea id="studentIds" placeholder="每行一个学号"></textarea>
         <button onclick="batchRegister()">批量注册</button>
         <div id="registerStatus" class="sources"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 首次登录修改密码弹窗 -->
+  <div id="pwdModal" class="modal hidden">
+    <div class="modal-backdrop" onclick="closePwdModal()"></div>
+    <div class="modal-content">
+      <h3>首次登录请修改密码</h3>
+      <p class="muted">为保障管理账号安全，请设置新的密码后再继续操作。</p>
+      <input type="password" id="newPassword" class="input" placeholder="新密码（至少6位）" style="width:100%; margin-top:10px;" />
+      <input type="password" id="confirmPassword" class="input" placeholder="确认新密码" style="width:100%; margin-top:10px;" />
+      <div id="pwdStatus" class="sources" style="margin-top:8px;"></div>
+      <div class="modal-actions">
+        <button class="secondary" onclick="closePwdModal()">取消</button>
+        <button onclick="changePassword()">确定修改</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 文档预览弹窗 -->
+  <div id="docModal" class="modal hidden">
+    <div class="modal-backdrop" onclick="closeDocModal()"></div>
+    <div class="modal-content" style="max-height:80vh; overflow:auto;">
+      <h3 id="docModalTitle">文档预览</h3>
+      <pre id="docModalContent" style="white-space:pre-wrap;"></pre>
+      <div class="modal-actions">
+        <button class="secondary" onclick="closeDocModal()">关闭</button>
       </div>
     </div>
   </div>

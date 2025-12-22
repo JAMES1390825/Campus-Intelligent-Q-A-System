@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from typing import Any, Dict, List, Tuple, Optional, Iterable
 
 from .config import get_settings, Settings
@@ -9,6 +10,8 @@ from .models import AgentTrace, QueryRequest, QueryResponse, ToolResult, SourceA
 from .rag import RAGPipeline
 from .tooling import ToolRouter
 from .langchain_pipeline import LangChainRAG
+
+logger = logging.getLogger("campusqa.agents")
 
 
 def simple_intent_detection(query: str) -> Tuple[str, str]:
@@ -55,7 +58,9 @@ class AgentOrchestrator:
         _ = reason  # silence unused warning
         traces.append(AgentTrace(name="intent", reasoning=reason, actions=[intent]))
 
+        logger.info("[agent] retrieve start top_k=%s", req.top_k)
         hits = self.rag.retrieve(req.query, top_k=req.top_k)
+        logger.info("[agent] retrieve done hits=%s", len(hits))
         traces.append(AgentTrace(name="retrieval", reasoning=f"Top-{req.top_k or self.settings.top_k}", actions=[h.chunk.id for h in hits]))
 
         used_tools: List[str] = []
@@ -63,7 +68,9 @@ class AgentOrchestrator:
         if req.need_tool and intent in {"procedure", "action"}:
             tool_name, payload, why = plan_tool(req.query)
             if tool_name:
+                logger.info("[agent] tool start=%s", tool_name)
                 tool_result = self.tools.call(tool_name, payload)
+                logger.info("[agent] tool done=%s", tool_name)
                 tool_results.append(tool_result)
                 used_tools.append(tool_name)
                 traces.append(AgentTrace(name="tool", reasoning=why, actions=[json.dumps(tool_result.model_dump(), ensure_ascii=False)]))
@@ -71,18 +78,22 @@ class AgentOrchestrator:
                 traces.append(AgentTrace(name="tool", reasoning="无需工具", actions=[]))
 
         if self.lc_rag:
+            logger.info("[agent] lc_rag answer start")
             answer_text = self.lc_rag.answer(req.query)
             latency_ms = None
             sources = [
                 SourceAttribution(source=h.chunk.source, snippet=h.chunk.text[:160], score=h.score)
                 for h in hits
             ]
+            logger.info("[agent] lc_rag answer done")
         else:
+            logger.info("[agent] rag answer start")
             answer_text, sources, latency_ms = self.rag.answer(
                 req.query,
                 top_k=req.top_k,
                 max_tokens=req.max_tokens,
             )
+            logger.info("[agent] rag answer done latency_ms=%s", latency_ms)
 
         if tool_results:
             formatted = "\n\n".join([

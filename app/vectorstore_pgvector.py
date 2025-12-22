@@ -101,9 +101,9 @@ class PGVectorStore:
             cur.execute(
                 f"""
                 SELECT chunk_id, document_id, source, source_type, metadata, content,
-                       (embedding <=> %s)::float AS distance
+                       (embedding <=> %s::vector)::float AS distance
                 FROM {self.table}
-                ORDER BY embedding <=> %s
+                ORDER BY embedding <=> %s::vector
                 LIMIT %s
                 """,
                 (q_emb, q_emb, top_k),

@@ -28,6 +28,17 @@ async function ask() {
         body: JSON.stringify({ query, top_k, need_tool, streaming: true })
       });
       if (!resp.ok) {
+        if (resp.status === 401) {
+          localStorage.removeItem('user_token');
+          result.innerHTML = '登录已失效，请重新登录';
+          return;
+        }
+        if (resp.status === 403) {
+          localStorage.setItem('user_must_change', '1');
+          result.innerHTML = '需先修改密码后再使用';
+          openPwdModal();
+          return;
+        }
         const err = await resp.text();
         result.innerHTML = '错误: ' + err;
         return;
@@ -65,6 +76,17 @@ async function ask() {
         body: JSON.stringify({ query, top_k, need_tool })
       });
       if (!resp.ok) {
+        if (resp.status === 401) {
+          localStorage.removeItem('user_token');
+          result.innerHTML = '登录已失效，请重新登录';
+          return;
+        }
+        if (resp.status === 403) {
+          localStorage.setItem('user_must_change', '1');
+          result.innerHTML = '需先修改密码后再使用';
+          openPwdModal();
+          return;
+        }
         const err = await resp.json();
         result.innerHTML = '错误: ' + err.detail;
         return;
@@ -137,6 +159,7 @@ async function submitPasswordChange(newPwd, statusEl) {
       return;
     }
     statusEl.textContent = '修改成功';
+    localStorage.setItem('user_must_change', '0');
     return true;
   } catch (e) {
     statusEl.textContent = '异常: ' + e;

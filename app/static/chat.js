@@ -1,7 +1,83 @@
+let lastPreviewName = null;
+
 function ensureAuth() {
   const token = localStorage.getItem('user_token');
   if (!token) {
     window.location.href = '/';
+  }
+}
+
+function renderAnswerWithSources(answer, sources, metaInfo) {
+  const chips = (sources || []).map(s => {
+    const score = s.score !== undefined ? ` (${s.score.toFixed(3)})` : '';
+    return `<span class="chip" data-doc="${s.source}">${s.source}${score}</span>`;
+  }).join(' ');
+  const meta = metaInfo || {};
+  const footer = `<div class="sources"><b>来源</b>: ${chips || '无'}</div>` +
+                 `<div class="sources"><b>意图</b>: ${meta.intent || ''}; 工具: ${(meta.used_tools || []).join(', ') || '无'}${meta.latency ? '; 延迟: ' + Math.round(meta.latency) + ' ms' : ''}</div>`;
+  return `<div class="card"><div>${answer.replace(/\n/g, '<br/>')}</div>${footer}</div>`;
+}
+
+function bindChipClicks(container) {
+  container.querySelectorAll('.chip').forEach(el => {
+    el.onclick = () => previewDoc(el.getAttribute('data-doc'));
+  });
+}
+
+async function previewDoc(name) {
+  if (!name) return;
+  lastPreviewName = name;
+  const token = localStorage.getItem('user_token');
+  const modal = document.getElementById('docPreviewModal');
+  const titleEl = document.getElementById('docPreviewTitle');
+  const bodyEl = document.getElementById('docPreviewBody');
+  if (titleEl) titleEl.textContent = name;
+  if (bodyEl) bodyEl.textContent = '加载中...';
+  if (modal) modal.classList.remove('hidden');
+  try {
+    const resp = await fetch(`/api/docs/${encodeURIComponent(name)}`, {
+      headers: token ? { 'Authorization': 'Bearer ' + token } : {}
+    });
+    if (!resp.ok) {
+      const err = await resp.text();
+      if (bodyEl) bodyEl.textContent = '加载失败: ' + err;
+      return;
+    }
+    const text = await resp.text();
+    if (bodyEl) bodyEl.textContent = text;
+  } catch (e) {
+    if (bodyEl) bodyEl.textContent = '异常: ' + e;
+  }
+}
+
+function closeDocPreview() {
+  const modal = document.getElementById('docPreviewModal');
+  if (modal) modal.classList.add('hidden');
+}
+
+async function downloadDoc() {
+  if (!lastPreviewName) return;
+  const token = localStorage.getItem('user_token');
+  try {
+    const resp = await fetch(`/api/docs/${encodeURIComponent(lastPreviewName)}/download`, {
+      headers: token ? { 'Authorization': 'Bearer ' + token } : {}
+    });
+    if (!resp.ok) {
+      const err = await resp.text();
+      alert('下载失败: ' + err);
+      return;
+    }
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = lastPreviewName;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    alert('下载异常: ' + e);
   }
 }
 
@@ -24,6 +100,17 @@ async function ask() {
         body: JSON.stringify({ query, top_k, need_tool, streaming: true })
       });
       if (!resp.ok) {
+        if (resp.status === 401) {
+          localStorage.removeItem('user_token');
+          window.location.href = '/';
+          return;
+        }
+        if (resp.status === 403) {
+          localStorage.setItem('user_must_change', '1');
+          result.innerHTML = '需先修改密码后再使用';
+          openPwdModal();
+          return;
+        }
         const err = await resp.text();
         result.innerHTML = '错误: ' + err;
         return;
@@ -49,10 +136,9 @@ async function ask() {
         }
       }
       if (meta) {
-        const sourcesHtml = meta.sources.map(s => `${s.source} (score ${s.score.toFixed(3)})`).join(' | ');
-        const footer = `<div class="sources"><b>来源</b>: ${sourcesHtml}</div>` +
-                       `<div class="sources"><b>意图</b>: ${meta.intent}; 工具: ${meta.used_tools.join(', ') || '无'}</div>`;
-        result.innerHTML = `<div class="card"><div>${answer.replace(/\n/g, '<br/>')}</div>${footer}</div>`;
+        const html = renderAnswerWithSources(answer, meta.sources, { intent: meta.intent, used_tools: meta.used_tools });
+        result.innerHTML = html;
+        bindChipClicks(result);
       }
     } else {
       const resp = await fetch('/api/query', {
@@ -61,16 +147,25 @@ async function ask() {
         body: JSON.stringify({ query, top_k, need_tool })
       });
       if (!resp.ok) {
+        if (resp.status === 401) {
+          localStorage.removeItem('user_token');
+          window.location.href = '/';
+          return;
+        }
+        if (resp.status === 403) {
+          localStorage.setItem('user_must_change', '1');
+          result.innerHTML = '需先修改密码后再使用';
+          openPwdModal();
+          return;
+        }
         const err = await resp.json();
         result.innerHTML = '错误: ' + err.detail;
         return;
       }
       const data = await resp.json();
-      let html = `<div class="card"><div>${data.answer.replace(/\n/g, '<br/>')}</div>`;
-      html += `<div class="sources"><b>来源</b>: ${data.sources.map(s => `${s.source} (score ${s.score.toFixed(3)})`).join(' | ')}</div>`;
-      html += `<div class="sources"><b>意图</b>: ${data.intent}; 工具: ${data.used_tools.join(', ') || '无'}; 延迟: ${Math.round(data.latency_ms)} ms</div>`;
-      html += `</div>`;
+      const html = renderAnswerWithSources(data.answer, data.sources, { intent: data.intent, used_tools: data.used_tools, latency: data.latency_ms });
       result.innerHTML = html;
+      bindChipClicks(result);
     }
   } catch (e) {
     result.innerHTML = '异常: ' + e;

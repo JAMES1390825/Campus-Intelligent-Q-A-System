@@ -1,17 +1,21 @@
+# pyright: reportMissingImports=false, reportMissingTypeStubs=false, reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false
 from __future__ import annotations
 
-import json
 import time
 from pathlib import Path
-from typing import List, Optional, Iterable
+from typing import List, Optional, Iterable, Any
 import logging
+
+import pypdf  # type: ignore
+import docx  # type: ignore
+import openpyxl  # type: ignore
+
 from .config import get_settings, Settings
 
 import numpy as np
 from openai import OpenAI
 import qianfan
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
-from sentence_transformers import SentenceTransformer
 from .models import DocumentChunk, RetrievedChunk, SourceAttribution
 from .prompts import ANSWER_PROMPT
 from .vectorstore import VectorStore
@@ -57,11 +61,47 @@ def chunk_text(text: str, chunk_size: int, overlap: int) -> List[str]:
     return chunks
 
 
+def _extract_text(path: Path) -> str:
+    ext = path.suffix.lower()
+    if ext in {".txt", ".md"}:
+        return path.read_text(encoding="utf-8", errors="ignore")
+    if ext == ".pdf":
+        with path.open("rb") as f:
+            reader = pypdf.PdfReader(f)
+            texts: List[str] = []
+            for page in reader.pages:
+                try:
+                    texts.append(page.extract_text() or "")
+                except Exception:
+                    continue
+            return "\n".join(texts)
+    if ext == ".docx":
+        doc = docx.Document(str(path))
+        return "\n".join(p.text for p in doc.paragraphs)
+    if ext == ".xlsx":
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        parts: List[str] = []
+        for sheet in wb:
+            for row in sheet.iter_rows(values_only=True):
+                cells = [str(c) for c in row if c is not None]
+                if cells:
+                    parts.append(" \t ".join(cells))
+        wb.close()
+        return "\n".join(parts)
+    return ""
+
+
 def load_documents(docs_path: Path, chunk_size: int, overlap: int, overlap_ratio: float = 0.15) -> List[DocumentChunk]:
     docs: List[DocumentChunk] = []
     effective_overlap = overlap if overlap > 0 else max(1, int(chunk_size * overlap_ratio))
-    for path in docs_path.glob("*.txt"):
-        text = path.read_text(encoding="utf-8")
+    for path in docs_path.glob("*"):
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in {".txt", ".md", ".pdf", ".docx", ".xlsx"}:
+            continue
+        text = _extract_text(path)
+        if not text.strip():
+            continue
         for idx, chunk in enumerate(chunk_text(text, chunk_size, effective_overlap)):
             docs.append(
                 DocumentChunk(
@@ -70,7 +110,7 @@ def load_documents(docs_path: Path, chunk_size: int, overlap: int, overlap_ratio
                     source=path.name,
                     source_type="file",
                     url=None,
-                    metadata={"chunk_id": idx},
+                    metadata={"chunk_id": idx, "ext": path.suffix.lower()},
                 )
             )
     return docs
@@ -81,6 +121,7 @@ class LLMClient:
         self.settings: Settings = settings or get_settings()
         self.client = None
         self.qianfan_chat = None
+        self._local_pipeline: Any = None
         if self.settings.use_qianfan:
             if not (self.settings.qianfan_access_key and self.settings.qianfan_secret_key):
                 raise RuntimeError("Qianfan enabled but access/secret key not configured")
@@ -120,7 +161,9 @@ class LLMClient:
                 max_output_tokens=max_tokens,
                 stream=False,
             )
-            return resp.get("result") or resp.get("body", {}).get("result", "")
+            if isinstance(resp, dict):
+                return resp.get("result") or resp.get("body", {}).get("result", "")
+            return ""
         if self.client:
             completion = self.client.chat.completions.create(
                 model=self.settings.openai_model,
@@ -128,7 +171,7 @@ class LLMClient:
                 temperature=0.2,
                 max_tokens=max_tokens,
             )
-            return completion.choices[0].message.content
+            return completion.choices[0].message.content or ""
 
         # If no API key, fallback to local small model (may trigger download once)
         if not self.settings.allow_local_fallback:
@@ -141,7 +184,7 @@ class LLMClient:
         """Yield text chunks. If client supports streaming, stream tokens; otherwise yield one chunk."""
         max_tokens = max_tokens or self.settings.generation_max_tokens
         if self.qianfan_chat:
-            stream = self.qianfan_chat.stream(
+            stream = self.qianfan_chat.stream(  # type: ignore[attr-defined]
                 model=self.settings.qianfan_chat_model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.2,
@@ -176,9 +219,10 @@ class RAGPipeline:
         self.llm = LLMClient(self.settings)
         self.embedder = EmbeddingProvider(self.settings)
         self.reranker = None
-        if self.settings.reranker_model:
+        model_name = (self.settings.reranker_model or "").strip()
+        if model_name:
             # API-based reranker via embedding similarity (no local HF download)
-            self.reranker = _APIReranker(self.embedder, model_name=self.settings.reranker_model)
+            self.reranker = _APIReranker(self.embedder, model_name=model_name)
 
     def retrieve(self, query: str, top_k: Optional[int] = None) -> List[RetrievedChunk]:
         k = top_k or self.settings.top_k

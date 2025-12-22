@@ -31,12 +31,57 @@ async function login() {
   }
 }
 
+function openPwdModal() {
+  const modal = document.getElementById('pwdModal');
+  if (modal) modal.classList.remove('hidden');
+}
+
+function closePwdModal() {
+  const modal = document.getElementById('pwdModal');
+  const statusEl = document.getElementById('pwdStatus');
+  const newInput = document.getElementById('newPassword');
+  const confirmInput = document.getElementById('confirmPassword');
+  if (statusEl) statusEl.textContent = '';
+  if (newInput) newInput.value = '';
+  if (confirmInput) confirmInput.value = '';
+  if (modal) modal.classList.add('hidden');
+}
+
+async function changePassword() {
+  const token = localStorage.getItem(TOKEN_KEY);
+  const newPwd = document.getElementById('newPassword').value;
+  const confirmPwd = document.getElementById('confirmPassword').value;
+  const statusEl = document.getElementById('pwdStatus');
+  if (!token) { setStatus(statusEl, '请先登录'); return; }
+  if (!newPwd || newPwd.length < 6) { setStatus(statusEl, '新密码至少6位'); return; }
+  if (newPwd !== confirmPwd) { setStatus(statusEl, '两次输入不一致'); return; }
+  try {
+    const params = new URLSearchParams();
+    params.append('new_password', newPwd);
+    const resp = await fetch('/api/auth/change_password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Authorization': 'Bearer ' + token },
+      body: params
+    });
+    if (!resp.ok) {
+      let errText = resp.statusText;
+      try { const err = await resp.json(); errText = err.detail || errText; } catch (_) {}
+      setStatus(statusEl, '修改失败: ' + errText);
+      return;
+    }
+    setStatus(statusEl, '修改成功');
+    closePwdModal();
+  } catch (e) {
+    setStatus(statusEl, '异常: ' + e);
+  }
+}
+
 async function uploadDoc() {
   const token = localStorage.getItem(TOKEN_KEY);
   const statusEl = document.getElementById('uploadStatus');
   const fileInput = document.getElementById('fileInput');
-  if (!token) { alert('请先登录'); return; }
-  if (!fileInput.files.length) { alert('请选择 .txt 文件'); return; }
+  if (!token) { window.location.href = '/admin'; return; }
+  if (!fileInput.files.length) { alert('请选择支持的文件 (.txt/.md/.pdf/.docx/.xlsx)'); return; }
   const file = fileInput.files[0];
   const form = new FormData();
   form.append('file', file);
@@ -49,6 +94,11 @@ async function uploadDoc() {
     });
     if (!resp.ok) {
       let errText = resp.statusText;
+      if (resp.status === 401) {
+        localStorage.removeItem(TOKEN_KEY);
+        setStatus(statusEl, '登录已失效，请重新登录');
+        return;
+      }
       try {
         const err = await resp.json();
         errText = err.detail || errText;
@@ -58,6 +108,7 @@ async function uploadDoc() {
     }
     const data = await resp.json();
     setStatus(statusEl, `上传成功: ${data.saved}，当前切片数 ${data.docs_count}`);
+    await loadDocs();
   } catch (e) {
     setStatus(statusEl, '异常: ' + e);
   }
@@ -67,7 +118,7 @@ async function batchRegister() {
   const token = localStorage.getItem(TOKEN_KEY);
   const statusEl = document.getElementById('registerStatus');
   const idsText = document.getElementById('studentIds').value.trim();
-  if (!token) { alert('请先登录'); return; }
+  if (!token) { window.location.href = '/admin'; return; }
   if (!idsText) { alert('请输入学号，每行一个'); return; }
   const student_ids = idsText.split(/\n+/).map(s => s.trim()).filter(Boolean);
   statusEl.textContent = '提交中...';
@@ -79,6 +130,11 @@ async function batchRegister() {
     });
     if (!resp.ok) {
       let errText = resp.statusText;
+      if (resp.status === 401) {
+        localStorage.removeItem(TOKEN_KEY);
+        statusEl.textContent = '登录已失效，请重新登录';
+        return;
+      }
       try { const err = await resp.json(); errText = err.detail || errText; } catch (_) {}
       statusEl.textContent = '错误: ' + errText;
       return;
@@ -88,4 +144,76 @@ async function batchRegister() {
   } catch (e) {
     statusEl.textContent = '异常: ' + e;
   }
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+  const token = localStorage.getItem(TOKEN_KEY);
+  if (!token) {
+    window.location.href = '/admin';
+  }
+  loadDocs();
+});
+
+async function loadDocs() {
+  const token = localStorage.getItem(TOKEN_KEY);
+  const listEl = document.getElementById('docsList');
+  if (!token || !listEl) return;
+  listEl.textContent = '加载中...';
+  try {
+    const resp = await fetch('/api/admin/docs', {
+      headers: { 'Authorization': 'Bearer ' + token }
+    });
+    if (!resp.ok) {
+      listEl.textContent = '加载失败';
+      return;
+    }
+    const data = await resp.json();
+    if (!data.docs || !data.docs.length) {
+      listEl.textContent = '暂无文档';
+      return;
+    }
+    listEl.innerHTML = '';
+    data.docs.forEach(item => {
+      const row = document.createElement('div');
+      row.className = 'list-row';
+      const link = document.createElement('a');
+      link.href = 'javascript:void(0)';
+      link.textContent = item.name + ` (${Math.round(item.size/1024)} KB)`;
+      link.onclick = () => viewDoc(item.name);
+      row.appendChild(link);
+      listEl.appendChild(row);
+    });
+  } catch (e) {
+    listEl.textContent = '异常: ' + e;
+  }
+}
+
+async function viewDoc(name) {
+  const token = localStorage.getItem(TOKEN_KEY);
+  if (!token) { window.location.href = '/admin'; return; }
+  const titleEl = document.getElementById('docModalTitle');
+  const contentEl = document.getElementById('docModalContent');
+  const modal = document.getElementById('docModal');
+  if (titleEl) titleEl.textContent = name;
+  if (contentEl) contentEl.textContent = '加载中...';
+  if (modal) modal.classList.remove('hidden');
+  try {
+    const resp = await fetch(`/api/admin/docs/${encodeURIComponent(name)}`, {
+      headers: { 'Authorization': 'Bearer ' + token }
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      contentEl.textContent = '加载失败: ' + errText;
+      return;
+    }
+    const text = await resp.text();
+    contentEl.textContent = text;
+  } catch (e) {
+    contentEl.textContent = '异常: ' + e;
+  }
+}
+
+function closeDocModal() {
+  const modal = document.getElementById('docModal');
+  if (modal) modal.classList.add('hidden');
 }
