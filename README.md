@@ -7,7 +7,7 @@
 - **多智能体协作**：意图识别 → 检索 Agent → 生成 Agent；支持工具调用分支（报修、申请草稿）。
 - **工具调用 Demo**：模拟“报修单”“申请草稿”工具，结果附加到回答中。
 - **流式输出**：`/api/query/stream` 支持流式生成，前端勾选“流式输出”可实时看到答案。
-- **可选重排**：配置 `CAMPUS_RAG_RERANKER_MODEL` 启用 reranker（如 `BAAI/bge-reranker-base`），提升命中质量。
+- **可选重排**：配置 `CAMPUS_RAG_RERANKER_MODEL` 启用重排，支持 `BAAI/bge-reranker-base` 等嵌入式 reranker，也可直接调用千帆 OpenAI 兼容端点上的 `qwen3-reranker-8b`（同一 `CAMPUS_RAG_OPENAI_API_KEY` 即可）。
 - **高性能实践**：
   - 归一化向量 + 内积检索，默认 Top-K=4。
   - 上下文裁剪（max_context_chars=3200），可配置。
@@ -51,7 +51,33 @@ CAMPUS_RAG_QIANFAN_OCR_GRANT_TYPE=client_credentials
 ```
 开启后，问答走千帆 Chat API，向量化用千帆 Embedding（FAISS/PgVector 均可）。
 
+若同时设置 `CAMPUS_RAG_RERANKER_MODEL=qwen3-reranker-8b`（或其他千帆重排模型），后端会直接调用 `qianfan.Reranker().do()`，无需再走 embedding 兜底或触发 Hugging Face 下载。
+
+如果你只配置了千帆 OpenAI 兼容接口（`CAMPUS_RAG_OPENAI_BASE_URL=https://qianfan.baidubce.com/v2` + API Key），系统会优先走 `/rerank` 端点完成重排；AK/SK 仅在需要访问千帆原生 API 时才是必需项。
+
 OCR：启用 `CAMPUS_RAG_USE_QIANFAN_OCR=true` 后，可用 `app.ocr_client.get_ocr_client()` 调用百度通用文字识别（general_basic）。可将图片转文本再走 ingest / 检索。
+
+## 对接阿里云 OSS（文档上传 & 向量化）
+项目支持将原始文档存入 OSS bucket，并在服务端自动同步到本地进行预览/向量化。配置步骤：
+
+1. 安装依赖（requirements 已包含 `oss2`）。
+2. 在 `.env` 中添加：
+  ```
+  CAMPUS_RAG_USE_OSS_STORAGE=true
+  CAMPUS_RAG_OSS_ENDPOINT=oss-cn-hangzhou.aliyuncs.com
+  CAMPUS_RAG_OSS_INTERNAL_ENDPOINT=oss-cn-hangzhou-internal.aliyuncs.com  # 可选，ECS 内网访问
+  CAMPUS_RAG_OSS_BUCKET=your-bucket
+  CAMPUS_RAG_OSS_ACCESS_KEY_ID=xxx
+  CAMPUS_RAG_OSS_ACCESS_KEY_SECRET=yyy
+  CAMPUS_RAG_OSS_PREFIX=docs  # 可选，桶内前缀，相当于“文件夹”
+  ```
+3. 重启服务后：
+  - 管理端上传的文件会写入 OSS 并同步一份到 `data/docs` 作为本地缓存。
+  - 启动阶段会尝试 `sync_from_remote()`，确保本地缓存包含 bucket 内所有历史文档。
+  - `/api/admin/docs` / 预览 / 下载 接口统一从缓存读取；若本地缺失会自动拉取 OSS 文件。
+  - 触发重建索引前再执行一次同步，保证向量化过程覆盖 OSS 中的全部文件。
+
+> 参考 FastGPT 的“上传 -> OSS 持久化 -> 后台异步向量化”模式。若有多实例部署，确保只有一台负责 ingest，或在 `scripts/ingest.py` 中显式调用 `DocumentStorage.sync_from_remote()` 再构建索引。
 
 ## 目录结构
 ```
@@ -79,7 +105,7 @@ data/docs/         # 示例文档
 
 ## 已知局限与下一步
 - 本地默认模型 `Qwen1.5-0.5B-Chat` 仅作演示，生产建议接入更强模型或部署 TGI/vLLM。
-- 未实现重排序/rerank，可在检索后加入模型（如 bge-reranker）。
+- 重排流程目前串行调用外部 API，后续可根据吞吐需求增加批量/并发能力。
 - LoRA 微调管线未在此仓库展开，可在 `peft`/`transformers` 基础上补充训练脚本。
 
 ## 版权声明

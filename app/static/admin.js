@@ -1,7 +1,688 @@
 const TOKEN_KEY = 'admin_token';
+let overviewCache = null;
+let uploadQueue = [];
+let uploadQueueCleanupTimer = null;
+const DEFAULT_ALLOWED_EXTS = ['.txt', '.md', '.pdf', '.docx', '.xlsx'];
+
+const STATUS_LABELS = {
+  pending: '排队中',
+  busy: '任务占用',
+  uploading: '上传中',
+  vectorizing: '向量化',
+  completed: '完成',
+  failed: '失败',
+  unknown: '未知状态',
+};
+
+const STATUS_BADGE_CLASS = {
+  pending: 'badge-pending',
+  busy: 'badge-busy',
+  uploading: 'badge-uploading',
+  vectorizing: 'badge-vectorizing',
+  completed: 'badge-success',
+  failed: 'badge-failed',
+  unknown: 'badge-muted',
+};
+
+const MAX_STATUS_ITEMS = 12;
+const APPROX_CHUNK_BYTES = 1800;
+const STATUS_PROGRESS = {
+  pending: 10,
+  uploading: 40,
+  vectorizing: 80,
+  completed: 100,
+  failed: 100,
+  busy: 30,
+};
+const FILE_TYPE_LABELS = {
+  txt: 'TXT 文本',
+  md: 'Markdown',
+  pdf: 'PDF',
+  docx: 'Word',
+  doc: 'Word',
+  xlsx: 'Excel',
+  csv: 'CSV',
+};
+
+function normalizeExt(ext) {
+  if (!ext) return '';
+  const value = String(ext).trim().toLowerCase();
+  if (!value) return '';
+  return value.startsWith('.') ? value : `.${value}`;
+}
+
+function normalizeUploadLimits(raw = null) {
+  const allowedExts = Array.isArray(raw?.allowed_exts)
+    ? raw.allowed_exts.map((ext) => normalizeExt(ext)).filter(Boolean)
+    : [];
+  const maxMb = typeof raw?.max_mb === 'number' && raw.max_mb > 0 ? raw.max_mb : null;
+  return {
+    maxMb,
+    maxBytes: maxMb ? maxMb * 1024 * 1024 : null,
+    allowedExts: allowedExts.length ? allowedExts : DEFAULT_ALLOWED_EXTS,
+  };
+}
+
+function getUploadLimits() {
+  if (overviewCache && overviewCache.upload_limits && overviewCache.upload_limits.__normalized) {
+    return overviewCache.upload_limits;
+  }
+  const normalized = normalizeUploadLimits(overviewCache?.upload_limits);
+  if (overviewCache) {
+    overviewCache.upload_limits = Object.assign({ __normalized: true }, normalized);
+  }
+  return normalized;
+}
+
+function renderUploadLimits(rawLimits = null) {
+  const normalized = rawLimits && rawLimits.__normalized ? rawLimits : normalizeUploadLimits(rawLimits);
+  if (overviewCache) {
+    overviewCache.upload_limits = Object.assign({ __normalized: true }, normalized);
+  }
+  const guardrailEl = document.getElementById('uploadGuardrails');
+  const hintsEl = document.getElementById('uploadHints');
+  if (guardrailEl) {
+    const limitText = normalized.maxMb ? `单个文件 ≤ ${normalized.maxMb} MB` : '未设置单文件大小限制';
+    guardrailEl.textContent = `限制：${limitText} · 支持：${normalized.allowedExts.join(' / ')}`;
+  }
+  if (hintsEl) {
+    hintsEl.textContent = '系统会在上传前计算内容指纹并自动跳过重复文件。';
+  }
+}
+
+async function computeFileHash(file) {
+  if (!file || !window.crypto || !window.crypto.subtle) return null;
+  const buffer = await file.arrayBuffer();
+  const digest = await window.crypto.subtle.digest('SHA-256', buffer);
+  const hashArray = Array.from(new Uint8Array(digest));
+  return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function getDocsHashMap() {
+  const docs = Array.isArray(overviewCache?.docs) ? overviewCache.docs : [];
+  const map = new Map();
+  docs.forEach((doc) => {
+    if (doc && typeof doc.hash === 'string' && doc.hash) {
+      map.set(doc.hash, doc);
+    }
+  });
+  return map;
+}
+
+function removeQueuedDuplicatesAgainstExisting() {
+  if (!uploadQueue.length) return;
+  const statusEl = document.getElementById('uploadStatus');
+  const hashMap = getDocsHashMap();
+  if (!hashMap.size) return;
+  const removed = [];
+  uploadQueue = uploadQueue.filter((item) => {
+    if (item.hash && hashMap.has(item.hash)) {
+      removed.push({ file: item.file.name, dup: hashMap.get(item.hash)?.name || '已存在文件' });
+      return false;
+    }
+    return true;
+  });
+  if (removed.length) {
+    renderUploadQueue();
+    const summary = removed
+      .slice(0, 3)
+      .map((entry) => `${entry.file} ↔ ${entry.dup}`)
+      .join('、');
+    const suffix = removed.length > 3 ? ` 等 ${removed.length} 个` : '';
+    setStatus(statusEl, `已移除重复文件：${summary}${suffix}`);
+  }
+}
+
+function ensureAdminToken() {
+  const token = localStorage.getItem(TOKEN_KEY);
+  if (!token) {
+    window.location.href = '/admin';
+    return null;
+  }
+  return token;
+}
+
+function authHeaders(token, extra = {}) {
+  return Object.assign({ Authorization: 'Bearer ' + token }, extra);
+}
+
+function updateText(id, text) {
+  const el = typeof id === 'string' ? document.getElementById(id) : id;
+  if (el) {
+    el.textContent = text;
+  }
+}
+
+function formatNumber(value, digits = 0, fallback = '-') {
+  if (value === null || value === undefined || Number.isNaN(value)) {
+    return fallback;
+  }
+  if (typeof value === 'number' && digits > 0) {
+    return value.toFixed(digits);
+  }
+  return String(value);
+}
+
+function normalizeStatus(status) {
+  if (!status) return 'unknown';
+  return String(status).toLowerCase();
+}
+
+function buildStatusBadge(status) {
+  const normalized = normalizeStatus(status);
+  const label = STATUS_LABELS[normalized] || STATUS_LABELS.unknown;
+  const className = STATUS_BADGE_CLASS[normalized] || STATUS_BADGE_CLASS.unknown;
+  return `<span class="status-badge ${className}">${label}</span>`;
+}
+
+function escapeHtml(text) {
+  if (text === null || text === undefined) return '';
+  return String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function setupAdminMenu() {
+  const trigger = document.getElementById('adminUserMenuButton');
+  const dropdown = document.getElementById('adminUserMenuDropdown');
+  if (!trigger || !dropdown) return;
+  trigger.addEventListener('click', (e) => {
+    e.stopPropagation();
+    dropdown.classList.toggle('open');
+  });
+  document.addEventListener('click', (e) => {
+    if (!dropdown.contains(e.target) && e.target !== trigger && !trigger.contains(e.target)) {
+      dropdown.classList.remove('open');
+    }
+  });
+  const changeBtn = document.getElementById('adminMenuChangePwd');
+  const logoutBtn = document.getElementById('adminMenuLogout');
+  if (changeBtn) {
+    changeBtn.onclick = () => {
+      dropdown.classList.remove('open');
+      navigateChangePassword();
+    };
+  }
+  if (logoutBtn) {
+    logoutBtn.onclick = () => {
+      dropdown.classList.remove('open');
+      adminLogout();
+    };
+  }
+}
+
+function adminLogout() {
+  localStorage.removeItem(TOKEN_KEY);
+  window.location.href = '/admin';
+}
+
+function navigateChangePassword() {
+  window.location.href = '/change-password?role=admin';
+}
 
 function setStatus(el, msg) {
+  if (!el) return;
   el.textContent = msg;
+}
+
+function updateSelectedFilesList(file) {
+  const container = document.getElementById('selectedFiles');
+  if (!container) return;
+  if (!file) {
+    container.textContent = '尚未选择文件';
+    return;
+  }
+  container.textContent = `最近加入：${file.name} (${formatSize(file.size)})`;
+}
+
+function resetFileSelection() {
+  const input = document.getElementById('fileInput');
+  if (!input) return;
+  input.value = '';
+  updateSelectedFilesList(null);
+}
+
+function guessFileType(filename) {
+  if (!filename) return '未知类型';
+  const parts = filename.split('.');
+  const ext = parts.length > 1 ? parts.pop().toLowerCase() : '';
+  if (!ext) return '未知类型';
+  return FILE_TYPE_LABELS[ext] || `${ext.toUpperCase()} 文件`;
+}
+
+function estimateChunkCount(file) {
+  const size = file?.size || 0;
+  if (!size) return 1;
+  return Math.max(1, Math.ceil(size / APPROX_CHUNK_BYTES));
+}
+
+function updateUploadQueueSummary() {
+  const summaryEl = document.getElementById('uploadQueueSummary');
+  if (!summaryEl) return;
+  if (!uploadQueue.length) {
+    summaryEl.textContent = '';
+    return;
+  }
+  const totalSize = uploadQueue.reduce((sum, item) => sum + (item.file.size || 0), 0);
+  const totalChunks = uploadQueue.reduce((sum, item) => sum + estimateChunkCount(item.file), 0);
+  summaryEl.textContent = `共 ${uploadQueue.length} 个文件 · ${formatSize(totalSize)} · 预估 ${totalChunks} 个切片`;
+}
+
+function moveUploadQueueItem(index, direction) {
+  const targetIndex = index + direction;
+  if (targetIndex < 0 || targetIndex >= uploadQueue.length) return;
+  const temp = uploadQueue[index];
+  uploadQueue[index] = uploadQueue[targetIndex];
+  uploadQueue[targetIndex] = temp;
+  renderUploadQueue();
+}
+
+function renderUploadQueue() {
+  const list = document.getElementById('uploadQueueList');
+  if (!list) return;
+  if (!uploadQueue.length) {
+    list.classList.add('muted');
+    list.innerHTML = '暂无文件';
+    updateUploadQueueSummary();
+    return;
+  }
+  list.classList.remove('muted');
+  list.innerHTML = '';
+  uploadQueue.forEach((item, index) => {
+    const row = document.createElement('div');
+    row.className = 'queue-item queue-item-rich';
+
+    const info = document.createElement('div');
+    info.className = 'queue-item-info';
+
+    const title = document.createElement('div');
+    title.className = 'queue-item-title';
+    title.innerHTML = `${escapeHtml(item.file.name)} <span class="status-badge badge-muted">${guessFileType(item.file.name)}</span>`;
+
+    const meta = document.createElement('div');
+    meta.className = 'queue-item-meta';
+    const modified = new Date(item.file.lastModified).toLocaleString();
+    meta.textContent = `大小 ${formatSize(item.file.size)} · 预估 ${estimateChunkCount(item.file)} 个切片 · 修改于 ${modified}`;
+
+    const statusLine = document.createElement('div');
+    statusLine.className = 'queue-item-status-line';
+    const currentStatus = normalizeStatus(item.status) || 'pending';
+    statusLine.innerHTML = buildStatusBadge(currentStatus);
+
+    const progressBar = document.createElement('div');
+    progressBar.className = 'queue-progress';
+    const progressInner = document.createElement('div');
+    progressInner.className = 'queue-progress-inner';
+    const progressValue = Math.min(100, item.progress ?? STATUS_PROGRESS[currentStatus] ?? 0);
+    progressInner.style.width = `${progressValue}%`;
+    progressBar.appendChild(progressInner);
+
+    info.appendChild(title);
+    info.appendChild(meta);
+    info.appendChild(statusLine);
+    info.appendChild(progressBar);
+
+    if (item.hash) {
+      const hashMeta = document.createElement('div');
+      hashMeta.className = 'queue-item-note muted';
+      hashMeta.style.fontFamily = 'monospace';
+      hashMeta.textContent = `指纹 ${item.hash.slice(0, 16)}${item.hash.length > 16 ? '…' : ''}`;
+      info.appendChild(hashMeta);
+    }
+
+    if (item.note) {
+      const note = document.createElement('div');
+      note.className = 'queue-item-note';
+      if (currentStatus === 'failed') {
+        note.classList.add('queue-item-note-error');
+      }
+      note.textContent = item.note;
+      info.appendChild(note);
+    }
+
+    const actions = document.createElement('div');
+    actions.className = 'queue-item-actions';
+
+    const upBtn = document.createElement('button');
+    upBtn.className = 'ghost';
+    upBtn.textContent = '上移';
+    upBtn.disabled = index === 0;
+    upBtn.onclick = () => moveUploadQueueItem(index, -1);
+
+    const downBtn = document.createElement('button');
+    downBtn.className = 'ghost';
+    downBtn.textContent = '下移';
+    downBtn.disabled = index === uploadQueue.length - 1;
+    downBtn.onclick = () => moveUploadQueueItem(index, 1);
+
+    const removeBtn = document.createElement('button');
+    removeBtn.className = 'ghost danger';
+    removeBtn.textContent = '移除';
+    removeBtn.onclick = () => {
+      uploadQueue.splice(index, 1);
+      renderUploadQueue();
+    };
+
+    actions.appendChild(upBtn);
+    actions.appendChild(downBtn);
+    actions.appendChild(removeBtn);
+
+    row.appendChild(info);
+    row.appendChild(actions);
+    list.appendChild(row);
+  });
+  updateUploadQueueSummary();
+}
+
+function syncQueueStatusesFromBackend(statusList = []) {
+  if (!uploadQueue.length || !Array.isArray(statusList) || !statusList.length) return;
+  const statusMap = new Map();
+  statusList.forEach((item) => {
+    const key = item.filename || item.doc;
+    if (key) {
+      statusMap.set(key, item);
+    }
+  });
+  let changed = false;
+  uploadQueue.forEach((entry) => {
+    const info = statusMap.get(entry.file.name);
+    if (!info) return;
+    const normalized = normalizeStatus(info.status);
+    if (normalized && normalized !== entry.status) {
+      entry.status = normalized;
+      entry.progress = STATUS_PROGRESS[normalized] ?? entry.progress;
+      changed = true;
+    }
+    if (info.error && info.error !== entry.note) {
+      entry.note = info.error;
+      changed = true;
+    }
+  });
+  if (changed) {
+    renderUploadQueue();
+  }
+}
+
+function scheduleQueueCleanup(delay = 5000) {
+  if (uploadQueueCleanupTimer) {
+    clearTimeout(uploadQueueCleanupTimer);
+  }
+  uploadQueueCleanupTimer = setTimeout(() => {
+    const before = uploadQueue.length;
+    uploadQueue = uploadQueue.filter((item) => item.status !== 'completed');
+    if (uploadQueue.length !== before) {
+      renderUploadQueue();
+    }
+    uploadQueueCleanupTimer = null;
+  }, delay);
+}
+
+let hashUnsupportedNotified = false;
+
+async function enqueueFile(file) {
+  const statusEl = document.getElementById('uploadStatus');
+  if (!file) return;
+  const limits = getUploadLimits();
+  const ext = normalizeExt(file.name.split('.').pop());
+  if (limits.allowedExts.length && (!ext || !limits.allowedExts.includes(ext))) {
+    setStatus(statusEl, `文件类型 ${ext || '未知'} 不在允许范围 ${limits.allowedExts.join(', ')}`);
+    return;
+  }
+  if (limits.maxBytes && file.size > limits.maxBytes) {
+    setStatus(statusEl, `文件 ${file.name} 超过大小限制 ${limits.maxMb} MB`);
+    return;
+  }
+
+  const duplicateCandidate = uploadQueue.some(
+    (item) =>
+      item.file.name === file.name &&
+      item.file.size === file.size &&
+      item.file.lastModified === file.lastModified,
+  );
+  if (duplicateCandidate) {
+    setStatus(statusEl, '该文件已在待上传列表中');
+    return;
+  }
+
+  let fileHash = null;
+  try {
+    fileHash = await computeFileHash(file);
+  } catch (error) {
+    console.warn('computeFileHash failed', error);
+  }
+
+  if (!fileHash && !hashUnsupportedNotified) {
+    setStatus(statusEl, '当前浏览器不支持内容指纹计算，将按常规方式加入');
+    hashUnsupportedNotified = true;
+  }
+
+  if (fileHash) {
+    const queueDup = uploadQueue.some((item) => item.hash && item.hash === fileHash);
+    if (queueDup) {
+      setStatus(statusEl, '该文件内容与待上传列表中的其他文件相同');
+      return;
+    }
+    const existingDoc = getDocsHashMap().get(fileHash);
+    if (existingDoc) {
+      setStatus(statusEl, `内容与现有文档 ${existingDoc.name || '已存在文件'} 重复，未加入`);
+      return;
+    }
+  }
+
+  uploadQueue.push({ file, status: 'pending', progress: STATUS_PROGRESS.pending, note: '', hash: fileHash });
+  renderUploadQueue();
+  const hashHint = fileHash ? `（指纹 ${fileHash.slice(0, 8)}…）` : '';
+  setStatus(statusEl, `已加入：${file.name} ${hashHint}`.trim());
+  updateSelectedFilesList(file);
+}
+
+function clearUploadQueue() {
+  uploadQueue = [];
+  if (uploadQueueCleanupTimer) {
+    clearTimeout(uploadQueueCleanupTimer);
+    uploadQueueCleanupTimer = null;
+  }
+  renderUploadQueue();
+}
+
+function renderStats(data = {}) {
+  const metrics = data.metrics || {};
+  const vector = data.vectorstore || {};
+  const redisInfo = data.redis || {};
+  const docs = Array.isArray(data.docs) ? data.docs : [];
+
+  updateText('statChunks', formatNumber(vector.vectors_indexed, 0, '-'));
+  updateText('statDocsCount', `文档数 ${formatNumber(data.docs_count ?? docs.length, 0, '-')}`);
+  updateText('statUploads', formatNumber(metrics.total_doc_uploads, 0, '0'));
+  updateText('statQueries', formatNumber(metrics.total_queries, 0, '0'));
+  updateText('statLatency', metrics.avg_latency_ms ? `avg latency ${formatNumber(metrics.avg_latency_ms, 1)} ms` : 'avg latency -');
+  updateText('statQueue', formatNumber(redisInfo.queue_length, 0, '-'));
+  updateText('statRedis', redisInfo.enabled ? '协调已启用' : '协调未启用');
+}
+
+function renderDocsTable(docs = []) {
+  const body = document.getElementById('docsTableBody');
+  if (!body) return;
+  if (!Array.isArray(docs) || docs.length === 0) {
+    body.innerHTML = '<tr><td colspan="6" class="sources">暂无文档</td></tr>';
+    return;
+  }
+
+  body.innerHTML = '';
+  docs.forEach((doc) => {
+    const tr = document.createElement('tr');
+
+    const nameTd = document.createElement('td');
+    const link = document.createElement('button');
+    link.className = 'link-button';
+    link.textContent = doc.name;
+    link.onclick = () => viewDoc(doc.name);
+    nameTd.appendChild(link);
+
+    const sizeTd = document.createElement('td');
+    sizeTd.textContent = formatSize(doc.size);
+
+    const updatedTd = document.createElement('td');
+    updatedTd.textContent = formatTimestamp(doc.mtime || doc.updated_at);
+
+    const statusTd = document.createElement('td');
+    const currentStatus = normalizeStatus(doc.status);
+    statusTd.innerHTML = buildStatusBadge(currentStatus);
+
+    const hashTd = document.createElement('td');
+    if (doc.hash) {
+      const shortHash = String(doc.hash).slice(0, 12);
+      hashTd.textContent = shortHash + (doc.hash.length > 12 ? '…' : '');
+      hashTd.title = doc.hash;
+      hashTd.style.fontFamily = 'monospace';
+    } else {
+      hashTd.textContent = '-';
+    }
+
+    const actionsTd = document.createElement('td');
+    const previewBtn = document.createElement('button');
+    previewBtn.className = 'ghost';
+    previewBtn.textContent = '预览';
+    previewBtn.onclick = () => viewDoc(doc.name);
+  const reindexBtn = document.createElement('button');
+  reindexBtn.className = 'ghost';
+  reindexBtn.textContent = '重建索引';
+  reindexBtn.onclick = () => reindexDoc(doc.name);
+  reindexBtn.disabled = ['pending', 'uploading', 'vectorizing', 'busy'].includes(currentStatus);
+    const deleteBtn = document.createElement('button');
+    deleteBtn.className = 'ghost danger';
+    deleteBtn.textContent = '删除';
+    deleteBtn.onclick = () => deleteDoc(doc.name);
+    actionsTd.appendChild(previewBtn);
+  actionsTd.appendChild(reindexBtn);
+    actionsTd.appendChild(deleteBtn);
+
+    tr.appendChild(nameTd);
+    tr.appendChild(sizeTd);
+    tr.appendChild(updatedTd);
+    tr.appendChild(statusTd);
+    tr.appendChild(hashTd);
+    tr.appendChild(actionsTd);
+
+    body.appendChild(tr);
+  });
+}
+
+function renderStatusList(items = []) {
+  const container = document.getElementById('statusList');
+  if (!container) return;
+  if (!Array.isArray(items) || items.length === 0) {
+    container.innerHTML = '<div class="sources">暂无状态</div>';
+    return;
+  }
+  container.innerHTML = '';
+  items.slice(0, MAX_STATUS_ITEMS).forEach((item) => {
+    const card = document.createElement('div');
+    card.className = 'status-card';
+    const statusLine = document.createElement('div');
+    statusLine.className = 'status-card-title';
+    statusLine.innerHTML = `${escapeHtml(item.doc || item.filename || '未知文档')} ${buildStatusBadge(item.status)}`;
+    const metaLine = document.createElement('div');
+    metaLine.className = 'status-card-meta';
+    const tsValue = item.ts ? Number(item.ts) : null;
+    const ts = tsValue ? new Date(tsValue * 1000).toLocaleTimeString() : '';
+    const details = [];
+    if (item.job_id) {
+      const shortId = String(item.job_id).slice(0, 8);
+      details.push(`任务 ${shortId}`);
+    }
+    if (item.admin) {
+      details.push(`操作 ${escapeHtml(item.admin)}`);
+    }
+    if (item.note) {
+      details.push(escapeHtml(item.note));
+    }
+    if (item.error) {
+      details.push(escapeHtml(item.error));
+    }
+    metaLine.innerHTML = `${ts}${details.length ? ' · ' + details.join(' · ') : ''}`;
+    card.appendChild(statusLine);
+    card.appendChild(metaLine);
+    container.appendChild(card);
+  });
+}
+
+function renderQueuePreview(redisInfo = {}) {
+  const list = document.getElementById('queueList');
+  if (!list) return;
+  const preview = Array.isArray(redisInfo.queue_preview) ? redisInfo.queue_preview : [];
+  if (!preview.length) {
+    list.innerHTML = '<div class="sources">队列为空</div>';
+    return;
+  }
+  list.innerHTML = '';
+  preview.forEach((item) => {
+    const row = document.createElement('div');
+    row.className = 'queue-item';
+    const title = escapeHtml(item.filename || item.doc || '未知任务');
+    const size = item.size ? ` · ${formatSize(item.size)}` : '';
+    const tsValue = item.ts ? Number(item.ts) : null;
+    const time = tsValue ? ` · ${new Date(tsValue * 1000).toLocaleTimeString()}` : '';
+    row.innerHTML = `<span class="queue-item-title">${title}</span><span class="queue-item-meta">${size}${time}</span>`;
+    list.appendChild(row);
+  });
+}
+
+function renderTesterResult(resp) {
+  const container = document.getElementById('testerResult');
+  const answerEl = document.getElementById('testerAnswer');
+  const sourcesEl = document.getElementById('testerSources');
+  if (!container || !answerEl || !sourcesEl) return;
+  answerEl.innerHTML = resp.answer ? escapeHtml(resp.answer).replace(/\n/g, '<br/>') : '无回答';
+  const sources = Array.isArray(resp.sources) ? resp.sources : [];
+  if (!sources.length) {
+    sourcesEl.innerHTML = '<div class="sources">无引用</div>';
+  } else {
+    sourcesEl.innerHTML = sources
+      .map((s) => `<div class="source-item"><strong>${escapeHtml(s.source || '未知来源')}</strong><p>${escapeHtml(s.snippet || '').slice(0, 160)}</p></div>`)
+      .join('');
+  }
+  container.classList.remove('hidden');
+}
+
+async function loadOverview() {
+  const token = ensureAdminToken();
+  if (!token) return;
+  const statusEl = document.getElementById('overviewStatus');
+  setStatus(statusEl, '加载中...');
+  try {
+    const resp = await fetch('/api/admin/overview', { headers: authHeaders(token) });
+    if (resp.status === 401) {
+      localStorage.removeItem(TOKEN_KEY);
+      window.location.href = '/admin';
+      return;
+    }
+    if (!resp.ok) {
+      const text = await resp.text();
+      setStatus(statusEl, '加载失败: ' + text);
+      return;
+    }
+    const data = await resp.json();
+    overviewCache = data;
+    renderUploadLimits(data.upload_limits);
+    renderStats(data);
+    renderDocsTable(data.docs || []);
+  renderStatusList(data.recent_history || data.recent_statuses || []);
+    renderQueuePreview(data.redis || {});
+    syncQueueStatusesFromBackend(data.recent_statuses || []);
+    removeQueuedDuplicatesAgainstExisting();
+    const docsStatus = document.getElementById('docsStatus');
+    if (docsStatus) {
+      const count = data.docs_count ?? (Array.isArray(data.docs) ? data.docs.length : 0);
+      docsStatus.textContent = `共 ${count} 个文件`;
+    }
+    setStatus(statusEl, `更新于 ${new Date().toLocaleTimeString()}`);
+  } catch (error) {
+    setStatus(statusEl, '加载失败: ' + error);
+  }
 }
 
 async function login() {
@@ -77,24 +758,38 @@ async function changePassword() {
 }
 
 async function uploadDoc() {
-  const token = localStorage.getItem(TOKEN_KEY);
+  const token = ensureAdminToken();
   const statusEl = document.getElementById('uploadStatus');
-  const fileInput = document.getElementById('fileInput');
-  if (!token) { window.location.href = '/admin'; return; }
-  if (!fileInput.files.length) { alert('请选择支持的文件 (.txt/.md/.pdf/.docx/.xlsx)'); return; }
-  const file = fileInput.files[0];
+  if (!token) return;
+  const pendingItems = uploadQueue.filter((item) => !item.status || item.status === 'pending' || item.status === 'failed');
+  if (!pendingItems.length) {
+    alert('没有可上传的文件，请先添加或清除已完成的条目');
+    return;
+  }
   const form = new FormData();
-  form.append('file', file);
-  setStatus(statusEl, '上传中...');
+  pendingItems.forEach((item) => {
+    form.append('files', item.file);
+    item.status = 'uploading';
+    item.progress = STATUS_PROGRESS.uploading;
+    item.note = '';
+  });
+  renderUploadQueue();
+  setStatus(statusEl, `上传中，共 ${pendingItems.length} 个文件...`);
   try {
     const resp = await fetch('/api/docs/upload', {
       method: 'POST',
-      headers: { 'Authorization': 'Bearer ' + token },
-      body: form
+      headers: { Authorization: 'Bearer ' + token },
+      body: form,
     });
     if (!resp.ok) {
       let errText = resp.statusText;
       if (resp.status === 401) {
+        pendingItems.forEach((item) => {
+          item.status = 'failed';
+          item.progress = STATUS_PROGRESS.failed;
+          item.note = '登录已失效';
+        });
+        renderUploadQueue();
         localStorage.removeItem(TOKEN_KEY);
         setStatus(statusEl, '登录已失效，请重新登录');
         return;
@@ -103,22 +798,85 @@ async function uploadDoc() {
         const err = await resp.json();
         errText = err.detail || errText;
       } catch (_) {}
+      pendingItems.forEach((item) => {
+        item.status = 'failed';
+        item.progress = STATUS_PROGRESS.failed;
+        item.note = errText;
+      });
+      renderUploadQueue();
       setStatus(statusEl, '错误: ' + errText);
       return;
     }
     const data = await resp.json();
-    setStatus(statusEl, `上传成功: ${data.saved}，当前切片数 ${data.docs_count}`);
-    await loadDocs();
+    const processed = Array.isArray(data.processed) ? data.processed : [];
+    const failed = Array.isArray(data.failed) ? data.failed : [];
+    const processedSet = new Set(processed);
+    pendingItems.forEach((item) => {
+      if (processedSet.has(item.file.name)) {
+        item.status = 'vectorizing';
+        item.progress = STATUS_PROGRESS.vectorizing;
+        item.note = '等待索引完成...';
+      }
+    });
+    failed.forEach((fail) => {
+      pendingItems.forEach((item) => {
+        if (item.file.name === fail.filename) {
+          item.status = 'failed';
+          item.progress = STATUS_PROGRESS.failed;
+          item.note = fail.reason || '处理失败';
+        }
+      });
+    });
+    renderUploadQueue();
+    const vectorization = data.vectorization || {};
+    let message;
+    if (vectorization.scheduled) {
+      const pendingList = Array.isArray(vectorization.pending) ? vectorization.pending : processed;
+      const names = pendingList.slice(0, 3).join('、');
+      const suffix = pendingList.length > 3 ? ` 等 ${pendingList.length} 个` : '';
+      message = `已提交 ${names || pendingList.length} 个文件${suffix}，后台索引重建中...`;
+    } else {
+      message = `已处理 ${processed.length} 个文件`;
+      if (typeof data.docs_count === 'number') {
+        message += `，当前切片数 ${data.docs_count}`;
+      }
+    }
+    if (failed.length) {
+      const failedInfo = failed
+        .map((item) => `${item.filename || '未知文件'}(${item.reason || '失败'})`)
+        .join('、');
+      message += `；失败 ${failed.length} 个：${failedInfo}`;
+    }
+    if (data.status === 'failed' && !processed.length) {
+      message = '上传失败，请检查文件后重试';
+    }
+    setStatus(statusEl, message);
+    await loadOverview();
+    pendingItems.forEach((item) => {
+      if (processedSet.has(item.file.name)) {
+        item.status = 'completed';
+        item.progress = STATUS_PROGRESS.completed;
+        item.note = '索引完成';
+      }
+    });
+    renderUploadQueue();
+    scheduleQueueCleanup();
   } catch (e) {
+    pendingItems.forEach((item) => {
+      item.status = 'failed';
+      item.progress = STATUS_PROGRESS.failed;
+      item.note = String(e);
+    });
+    renderUploadQueue();
     setStatus(statusEl, '异常: ' + e);
   }
 }
 
 async function batchRegister() {
-  const token = localStorage.getItem(TOKEN_KEY);
+  const token = ensureAdminToken();
   const statusEl = document.getElementById('registerStatus');
   const idsText = document.getElementById('studentIds').value.trim();
-  if (!token) { window.location.href = '/admin'; return; }
+  if (!token) return;
   if (!idsText) { alert('请输入学号，每行一个'); return; }
   const student_ids = idsText.split(/\n+/).map(s => s.trim()).filter(Boolean);
   statusEl.textContent = '提交中...';
@@ -147,50 +905,113 @@ async function batchRegister() {
 }
 
 window.addEventListener('DOMContentLoaded', () => {
-  const token = localStorage.getItem(TOKEN_KEY);
-  if (!token) {
-    window.location.href = '/admin';
+  setupAdminMenu();
+  renderUploadQueue();
+  renderUploadLimits();
+  const fileInput = document.getElementById('fileInput');
+  if (fileInput) {
+    updateSelectedFilesList(null);
+    fileInput.addEventListener('change', async (event) => {
+      const target = event.target;
+      if (target && target.files && target.files.length) {
+        const files = Array.from(target.files);
+        for (const file of files) {
+          // eslint-disable-next-line no-await-in-loop
+          await enqueueFile(file);
+        }
+        target.value = '';
+      }
+    });
   }
-  loadDocs();
+  const token = ensureAdminToken();
+  if (!token) return;
+  loadOverview();
 });
 
-async function loadDocs() {
-  const token = localStorage.getItem(TOKEN_KEY);
-  const listEl = document.getElementById('docsList');
-  if (!token || !listEl) return;
-  listEl.textContent = '加载中...';
+async function deleteDoc(name) {
+  const token = ensureAdminToken();
+  const statusEl = document.getElementById('docsStatus');
+  if (!token) return;
+  if (!confirm(`确认删除 ${name} ?`)) return;
+  if (statusEl) statusEl.textContent = '删除中...';
   try {
-    const resp = await fetch('/api/admin/docs', {
+    const resp = await fetch(`/api/admin/docs/${encodeURIComponent(name)}`, {
+      method: 'DELETE',
       headers: { 'Authorization': 'Bearer ' + token }
     });
     if (!resp.ok) {
-      listEl.textContent = '加载失败';
+      if (resp.status === 401) {
+        localStorage.removeItem(TOKEN_KEY);
+        window.location.href = '/admin';
+        return;
+      }
+      let errText = resp.statusText;
+      try {
+        const err = await resp.json();
+        errText = err.detail || errText;
+      } catch (_) {}
+      if (statusEl) statusEl.textContent = '删除失败: ' + errText;
       return;
     }
     const data = await resp.json();
-    if (!data.docs || !data.docs.length) {
-      listEl.textContent = '暂无文档';
-      return;
-    }
-    listEl.innerHTML = '';
-    data.docs.forEach(item => {
-      const row = document.createElement('div');
-      row.className = 'list-row';
-      const link = document.createElement('a');
-      link.href = 'javascript:void(0)';
-      link.textContent = item.name + ` (${Math.round(item.size/1024)} KB)`;
-      link.onclick = () => viewDoc(item.name);
-      row.appendChild(link);
-      listEl.appendChild(row);
-    });
+    await loadOverview();
+    if (statusEl) statusEl.textContent = `已删除 ${data.name}，剩余 ${data.docs_count} 个文档`;
   } catch (e) {
-    listEl.textContent = '异常: ' + e;
+    if (statusEl) statusEl.textContent = '异常: ' + e;
   }
 }
 
+async function reindexDoc(name) {
+  const token = ensureAdminToken();
+  const statusEl = document.getElementById('docsStatus');
+  if (!token) return;
+  if (!confirm(`重新构建 ${name} 的向量索引？`)) return;
+  if (statusEl) statusEl.textContent = `正在重建 ${name} ...`;
+  try {
+    const resp = await fetch(`/api/admin/docs/${encodeURIComponent(name)}/reindex`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + token },
+    });
+    if (!resp.ok) {
+      if (resp.status === 401) {
+        localStorage.removeItem(TOKEN_KEY);
+        window.location.href = '/admin';
+        return;
+      }
+      let errText = resp.statusText;
+      try {
+        const err = await resp.json();
+        errText = err.detail || errText;
+      } catch (_) {}
+      if (statusEl) statusEl.textContent = '重建失败: ' + errText;
+      return;
+    }
+    await loadOverview();
+    if (statusEl) statusEl.textContent = `已触发 ${name} 的重建任务`;
+  } catch (e) {
+    if (statusEl) statusEl.textContent = '异常: ' + e;
+  }
+}
+
+function formatSize(bytes) {
+  if (!bytes && bytes !== 0) return '未知大小';
+  if (bytes < 1024) return `${bytes} B`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${kb.toFixed(1)} KB`;
+  const mb = kb / 1024;
+  return `${mb.toFixed(2)} MB`;
+}
+
+function formatTimestamp(ts) {
+  if (!ts) return '未知时间';
+  const date = new Date(ts * 1000);
+  if (Number.isNaN(date.getTime())) return '未知时间';
+  return `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,'0')}-${String(date.getDate()).padStart(2,'0')} ${String(date.getHours()).padStart(2,'0')}:${String(date.getMinutes()).padStart(2,'0')}`;
+}
+
 async function viewDoc(name) {
-  const token = localStorage.getItem(TOKEN_KEY);
-  if (!token) { window.location.href = '/admin'; return; }
+  const token = ensureAdminToken();
+  if (!token) return;
   const titleEl = document.getElementById('docModalTitle');
   const contentEl = document.getElementById('docModalContent');
   const modal = document.getElementById('docModal');
@@ -199,21 +1020,78 @@ async function viewDoc(name) {
   if (modal) modal.classList.remove('hidden');
   try {
     const resp = await fetch(`/api/admin/docs/${encodeURIComponent(name)}`, {
-      headers: { 'Authorization': 'Bearer ' + token }
+      headers: authHeaders(token),
     });
+    if (resp.status === 401) {
+      localStorage.removeItem(TOKEN_KEY);
+      window.location.href = '/admin';
+      return;
+    }
     if (!resp.ok) {
       const errText = await resp.text();
-      contentEl.textContent = '加载失败: ' + errText;
+      if (contentEl) contentEl.textContent = '加载失败: ' + errText;
       return;
     }
     const text = await resp.text();
-    contentEl.textContent = text;
+    if (contentEl) contentEl.textContent = text;
   } catch (e) {
-    contentEl.textContent = '异常: ' + e;
+    if (contentEl) contentEl.textContent = '异常: ' + e;
   }
 }
 
 function closeDocModal() {
   const modal = document.getElementById('docModal');
   if (modal) modal.classList.add('hidden');
+}
+
+async function runTestQuery() {
+  const token = ensureAdminToken();
+  if (!token) return;
+  const questionEl = document.getElementById('testerQuestion');
+  const testerStatus = document.getElementById('testerStatus');
+  const resultEl = document.getElementById('testerResult');
+  if (!questionEl) return;
+  const query = questionEl.value.trim();
+  if (!query) {
+    setStatus(testerStatus, '请输入测试问题');
+    return;
+  }
+  if (resultEl) resultEl.classList.add('hidden');
+  setStatus(testerStatus, '调试中...');
+  const topKInput = document.getElementById('testerTopK');
+  const needToolInput = document.getElementById('testerNeedTool');
+  const topK = topKInput ? parseInt(topKInput.value, 10) || 4 : 4;
+  const needTool = needToolInput ? !!needToolInput.checked : true;
+  const payload = {
+    query,
+    top_k: topK,
+    need_tool: needTool,
+    streaming: false,
+  };
+  try {
+    const resp = await fetch('/api/admin/test_query', {
+      method: 'POST',
+      headers: authHeaders(token, { 'Content-Type': 'application/json' }),
+      body: JSON.stringify(payload),
+    });
+    if (resp.status === 401) {
+      localStorage.removeItem(TOKEN_KEY);
+      window.location.href = '/admin';
+      return;
+    }
+    if (!resp.ok) {
+      let errText = resp.statusText;
+      try {
+        const err = await resp.json();
+        errText = err.detail || errText;
+      } catch (_) {}
+      setStatus(testerStatus, '调用失败: ' + errText);
+      return;
+    }
+    const data = await resp.json();
+    renderTesterResult(data);
+    setStatus(testerStatus, '调试完成');
+  } catch (error) {
+    setStatus(testerStatus, '异常: ' + error);
+  }
 }

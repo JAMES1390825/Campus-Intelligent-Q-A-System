@@ -7,30 +7,159 @@
 </head>
 <body>
   <div class="container">
-    <h1>管理端 · 文档上传</h1>
-    <div class="subtitle">仅管理员可上传/重建索引，学生端请访问 /</div>
-
-    <div class="card">
-      <h3>上传文档（支持 .txt/.md/.pdf/.docx/.xlsx）</h3>
-      <div class="upload-area">
-        <input type="file" id="fileInput" accept=".txt,.md,.pdf,.docx,.xlsx" />
-        <button onclick="uploadDoc()">上传并重建索引</button>
-        <div id="uploadStatus" class="sources"></div>
+    <div class="top-bar">
+      <div>
+        <h1>管理端 · 知识库控制台</h1>
+        <div class="subtitle">监控文档、解析状态与对话调试</div>
+      </div>
+      <div class="user-menu">
+        <button class="user-menu-button" id="adminUserMenuButton" type="button">
+          管理员
+          <span aria-hidden="true">▾</span>
+        </button>
+        <div class="user-menu-dropdown" id="adminUserMenuDropdown">
+          <button type="button" id="adminMenuChangePwd">修改密码</button>
+          <button type="button" id="adminMenuLogout">退出登录</button>
+        </div>
       </div>
     </div>
 
     <div class="card">
-      <h3>已上传文档</h3>
-      <div class="sources" style="margin-bottom:8px;">点击文件名可预览原文。</div>
-      <div id="docsList" class="list"></div>
+      <div class="card-header">
+        <div>
+          <h3>运行概览</h3>
+          <p class="sources">实时查看索引、Redis 队列与调用指标</p>
+        </div>
+        <button class="secondary small" onclick="loadOverview()">刷新</button>
+      </div>
+      <div class="stats-grid" id="statsGrid">
+        <div class="stat-card">
+          <div class="stat-label">已索引片段</div>
+          <div class="stat-value" id="statChunks">-</div>
+          <div class="stat-sub" id="statDocsCount">文档数 -</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">文档上传</div>
+          <div class="stat-value" id="statUploads">-</div>
+          <div class="stat-sub">Metrics · total_doc_uploads</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">问答请求</div>
+          <div class="stat-value" id="statQueries">-</div>
+          <div class="stat-sub" id="statLatency">avg latency - ms</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Redis 队列</div>
+          <div class="stat-value" id="statQueue">-</div>
+          <div class="stat-sub" id="statRedis">协调未启用</div>
+        </div>
+      </div>
+      <div id="overviewStatus" class="sources"></div>
+    </div>
+
+    <div class="grid-two">
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <h3>知识库文件</h3>
+            <p class="sources">点击名称可预览，右侧可删除</p>
+          </div>
+          <button class="secondary small" onclick="loadOverview()">刷新</button>
+        </div>
+        <div class="table-wrapper">
+          <table class="doc-table">
+            <thead>
+              <tr>
+                <th>名称</th>
+                <th>大小</th>
+                <th>更新时间</th>
+                <th>状态</th>
+                <th>指纹</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="docsTableBody">
+              <tr><td colspan="6" class="sources">加载中...</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div id="docsStatus" class="sources"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <h3>处理状态 & 队列</h3>
+            <p class="sources">来自 Redis 协调器</p>
+          </div>
+          <button class="secondary small" onclick="loadOverview()">同步</button>
+        </div>
+        <div>
+          <h4 class="section-title">任务历史</h4>
+          <div id="statusList" class="status-list"></div>
+        </div>
+        <div class="divider"></div>
+        <div>
+          <h4 class="section-title">队列预览</h4>
+          <div id="queueList" class="queue-list"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="grid-two">
+      <div class="card">
+        <h3>上传文档（支持 .txt/.md/.pdf/.docx/.xlsx）</h3>
+        <p class="sources">单次选择一个文件，即会自动加入待上传列表，可连续选择多个文件后统一索引。</p>
+        <div id="uploadGuardrails" class="sources"></div>
+        <div id="uploadHints" class="sources muted"></div>
+        <div class="upload-area">
+          <input type="file" id="fileInput" name="files" accept=".txt,.md,.pdf,.docx,.xlsx" />
+          <div class="controls" style="gap:10px; flex-wrap: wrap;">
+            <button onclick="uploadDoc()">上传并重建索引</button>
+            <button type="button" class="ghost" onclick="resetFileSelection()">清空当前选择</button>
+            <button type="button" class="ghost danger" onclick="clearUploadQueue()">清空待上传列表</button>
+          </div>
+          <div id="selectedFiles" class="sources muted">尚未选择文件</div>
+          <div class="divider" style="margin:12px 0;"></div>
+          <div>
+            <h4 class="section-title">待上传列表</h4>
+            <div id="uploadQueueList" class="queue-list muted">暂无文件</div>
+            <div id="uploadQueueSummary" class="sources" style="margin-top:6px;"></div>
+          </div>
+        </div>
+        <div id="uploadStatus" class="sources"></div>
+      </div>
+
+      <div class="card">
+        <h3>批量注册学生账号</h3>
+        <div class="controls" style="flex-direction: column; align-items: flex-start; gap:10px;">
+          <textarea id="studentIds" placeholder="每行一个学号"></textarea>
+          <button onclick="batchRegister()">批量注册</button>
+          <div id="registerStatus" class="sources"></div>
+        </div>
+      </div>
     </div>
 
     <div class="card">
-      <h3>批量注册学生账号</h3>
-      <div class="controls" style="flex-direction: column; align-items: flex-start; gap:10px;">
-        <textarea id="studentIds" placeholder="每行一个学号"></textarea>
-        <button onclick="batchRegister()">批量注册</button>
-        <div id="registerStatus" class="sources"></div>
+      <div class="card-header">
+        <div>
+          <h3>对话 / 检索调试</h3>
+          <p class="sources">直接调用 RAG 流程，便于排查答案与引用</p>
+        </div>
+      </div>
+      <textarea id="testerQuestion" placeholder="输入要测试的问题，例如：最新奖学金政策是什么？"></textarea>
+      <div class="controls">
+        <label>Top-K <input type="number" id="testerTopK" min="1" max="10" value="4" /></label>
+        <label><input type="checkbox" id="testerNeedTool" checked /> 允许工具调用</label>
+        <button onclick="runTestQuery()">运行调试</button>
+      </div>
+      <div id="testerStatus" class="sources"></div>
+      <div id="testerResult" class="query-result hidden">
+        <div class="query-answer" id="testerAnswer"></div>
+        <div class="query-sources">
+          <div class="label">引用片段</div>
+          <div id="testerSources" class="query-sources-list"></div>
+        </div>
       </div>
     </div>
   </div>

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import List, Optional, Iterable, Any
+from typing import List, Optional, Iterable, Any, Dict
 import logging
 
 import pypdf  # type: ignore
@@ -13,6 +13,7 @@ import openpyxl  # type: ignore
 from .config import get_settings, Settings
 
 import numpy as np
+import httpx
 from openai import OpenAI
 import qianfan
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
@@ -20,6 +21,129 @@ from .models import DocumentChunk, RetrievedChunk, SourceAttribution
 from .prompts import ANSWER_PROMPT
 from .vectorstore import VectorStore
 from .embedding_provider import EmbeddingProvider
+
+
+class QianfanReranker:
+    """Use Baidu Qianfan's native rerank API instead of embedding similarity hacks."""
+
+    SCORE_KEYS = ("relevance_score", "score", "similarity", "rerank_score", "probability")
+    INDEX_KEYS = ("index", "position", "document_index", "doc_index", "order")
+
+    def __init__(self, settings: Settings, model_name: str):
+        if not (settings.qianfan_access_key and settings.qianfan_secret_key):
+            raise RuntimeError("Qianfan reranker requires CAMPUS_RAG_QIANFAN_ACCESS_KEY/SECRET_KEY")
+        if not getattr(qianfan, "Reranker", None):
+            raise RuntimeError("qianfan package does not expose Reranker API")
+        self.settings = settings
+        self.model_name = model_name
+        self._client = qianfan.Reranker(
+            ak=settings.qianfan_access_key,
+            sk=settings.qianfan_secret_key,
+        )
+
+    def rerank(self, query: str, hits: List[RetrievedChunk], top_k: int) -> List[RetrievedChunk]:
+        if not hits:
+            return []
+
+        candidate_limit = max(top_k or self.settings.top_k, self.settings.rerank_top_n)
+        candidates = hits[:candidate_limit]
+        documents = [h.chunk.text for h in candidates]
+        try:
+            resp = self._client.do(
+                query=query,
+                documents=documents,
+                top_n=min(top_k or len(candidates), len(candidates)),
+                model=self.model_name,
+            )
+        except Exception as exc:  # pragma: no cover - remote API failure
+            logger.warning("Qianfan reranker request failed: %s", exc)
+            raise
+
+        entries = self._extract_entries(resp)
+        if not entries:
+            logger.warning("Qianfan reranker returned empty result; falling back to original ranking")
+            return candidates[:top_k]
+
+        scored: List[RetrievedChunk] = []
+        used: set[int] = set()
+        for entry in entries:
+            idx = self._resolve_index(entry, documents)
+            if idx is None or not 0 <= idx < len(candidates):
+                continue
+            if idx in used:
+                continue
+            score = self._resolve_score(entry, default=candidates[idx].score)
+            scored.append(RetrievedChunk(chunk=candidates[idx].chunk, score=score))
+            used.add(idx)
+            if len(scored) >= top_k:
+                break
+
+        if len(scored) < min(top_k, len(candidates)):
+            for i, item in enumerate(candidates):
+                if len(scored) >= top_k:
+                    break
+                if i in used:
+                    continue
+                scored.append(RetrievedChunk(chunk=item.chunk, score=item.score))
+
+        return scored
+
+    def _extract_entries(self, resp: Any) -> List[Dict[str, Any]]:
+        if resp is None:
+            return []
+        body: Dict[str, Any]
+        if hasattr(resp, "body") and isinstance(resp.body, dict):
+            body = resp.body
+        elif isinstance(resp, dict):
+            body = resp
+        else:
+            return []
+
+        candidates = self._first_list(body, ("result", "results", "data"))
+        if isinstance(candidates, dict):
+            candidates = self._first_list(candidates, ("documents", "items", "data"))
+        if isinstance(candidates, list):
+            return candidates
+        for key in ("documents", "items", "data"):
+            val = body.get(key)
+            if isinstance(val, list):
+                return val
+        return []
+
+    @staticmethod
+    def _first_list(payload: Dict[str, Any], keys: Iterable[str]) -> Any:
+        for key in keys:
+            val = payload.get(key)
+            if isinstance(val, list) or isinstance(val, dict):
+                return val
+        return None
+
+    def _resolve_index(self, entry: Dict[str, Any], documents: List[str]) -> Optional[int]:
+        for key in self.INDEX_KEYS:
+            value = entry.get(key)
+            if isinstance(value, int):
+                return value
+            if isinstance(value, str) and value.isdigit():
+                return int(value)
+        doc_text = entry.get("document") or entry.get("text") or entry.get("content")
+        if isinstance(doc_text, str):
+            try:
+                return documents.index(doc_text)
+            except ValueError:
+                return None
+        return None
+
+    def _resolve_score(self, entry: Dict[str, Any], default: float) -> float:
+        for key in self.SCORE_KEYS:
+            value = entry.get(key)
+            if isinstance(value, (int, float)):
+                return float(value)
+            if isinstance(value, str):
+                try:
+                    return float(value)
+                except ValueError:
+                    continue
+        return float(default)
 class _APIReranker:
     """API-based reranker using embedding similarity (no local HF download).
 
@@ -42,6 +166,98 @@ class _APIReranker:
         scores = np.matmul(doc_vecs, q_vec)
         reranked = sorted(zip(candidates, scores), key=lambda x: float(x[1]), reverse=True)[:top_k]
         return [RetrievedChunk(chunk=h.chunk, score=float(s)) for h, s in reranked]
+
+
+class OpenAICompatibleReranker:
+    """Calls Qianfan's OpenAI-compatible /rerank endpoint and emits relevance scores."""
+
+    SCORE_KEYS = ("relevance_score", "score", "similarity")
+
+    def __init__(self, settings: Settings, model_name: str, timeout: float = 20.0):
+        if not settings.openai_api_key or not settings.openai_base_url:
+            raise RuntimeError("OpenAI-compatible reranker requires CAMPUS_RAG_OPENAI_API_KEY and BASE_URL")
+        self.settings = settings
+        self.model_name = model_name
+        self.api_key = settings.openai_api_key
+        self.base_url = settings.openai_base_url.rstrip("/")
+        self.timeout = timeout
+
+    def rerank(self, query: str, hits: List[RetrievedChunk], top_k: int) -> List[RetrievedChunk]:
+        if not hits:
+            return []
+
+        candidate_limit = max(top_k or self.settings.top_k, self.settings.rerank_top_n)
+        candidates = hits[:candidate_limit]
+        documents = [h.chunk.text for h in candidates]
+        payload = {
+            "model": self.model_name,
+            "query": query,
+            "documents": documents,
+            "top_n": min(top_k or len(candidates), len(candidates)),
+        }
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        url = f"{self.base_url}/rerank"
+        resp = httpx.post(url, json=payload, headers=headers, timeout=self.timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        entries = self._extract_entries(data)
+        if not entries:
+            logger.warning("OpenAI-compatible reranker returned empty result; fallback to recall order")
+            return candidates[:top_k]
+
+        scored: List[RetrievedChunk] = []
+        used: set[int] = set()
+        for entry in entries:
+            idx = self._resolve_index(entry)
+            if idx is None or idx >= len(candidates) or idx in used:
+                continue
+            score = self._resolve_score(entry, default=candidates[idx].score)
+            scored.append(RetrievedChunk(chunk=candidates[idx].chunk, score=score))
+            used.add(idx)
+            if len(scored) >= min(top_k, len(candidates)):
+                break
+
+        if len(scored) < min(top_k, len(candidates)):
+            for i, item in enumerate(candidates):
+                if len(scored) >= top_k:
+                    break
+                if i in used:
+                    continue
+                scored.append(RetrievedChunk(chunk=item.chunk, score=item.score))
+
+        return scored
+
+    @staticmethod
+    def _extract_entries(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        for key in ("results", "data", "result"):
+            val = data.get(key)
+            if isinstance(val, list):
+                return val
+        return []
+
+    @staticmethod
+    def _resolve_index(entry: Dict[str, Any]) -> Optional[int]:
+        idx = entry.get("index")
+        if isinstance(idx, int):
+            return idx
+        if isinstance(idx, str) and idx.isdigit():
+            return int(idx)
+        return None
+
+    def _resolve_score(self, entry: Dict[str, Any], default: float) -> float:
+        for key in self.SCORE_KEYS:
+            value = entry.get(key)
+            if isinstance(value, (int, float)):
+                return float(value)
+            if isinstance(value, str):
+                try:
+                    return float(value)
+                except ValueError:
+                    continue
+        return float(default)
 
 
 
@@ -221,15 +437,18 @@ class RAGPipeline:
         self.reranker = None
         model_name = (self.settings.reranker_model or "").strip()
         if model_name:
-            # API-based reranker via embedding similarity (no local HF download)
-            self.reranker = _APIReranker(self.embedder, model_name=model_name)
+            self.reranker = self._init_reranker(model_name)
 
     def retrieve(self, query: str, top_k: Optional[int] = None) -> List[RetrievedChunk]:
         k = top_k or self.settings.top_k
         hits = self.vectorstore.search(query, max(k, self.settings.rerank_top_n if self.reranker else k))
         if self.reranker:
-            reranked = self.reranker.rerank(query, hits, top_k=k)
-            return reranked
+            try:
+                reranked = self.reranker.rerank(query, hits, top_k=k)
+                return reranked
+            except Exception:
+                logger.exception("Reranker failed; falling back to original recall results")
+                return hits[:k]
         return hits
 
     @staticmethod
@@ -253,6 +472,42 @@ class RAGPipeline:
         context = self._build_context(hits, self.settings.max_context_chars)
         prompt = ANSWER_PROMPT.format(query=query, context=context)
         return self.llm.generate_stream(prompt, max_tokens=max_tokens)
+
+    def _init_reranker(self, model_name: str):
+        reranker = None
+        if self._should_use_openai_reranker(model_name):
+            try:
+                reranker = OpenAICompatibleReranker(self.settings, model_name=model_name)
+                logger.info("Initialized OpenAI-compatible reranker model=%s", model_name)
+            except Exception as exc:
+                logger.warning("Failed to init OpenAI-compatible reranker (%s): %s", model_name, exc)
+        if reranker is None and self._should_use_qianfan_reranker(model_name):
+            try:
+                reranker = QianfanReranker(self.settings, model_name=model_name)
+                logger.info("Initialized Qianfan reranker model=%s", model_name)
+            except Exception as exc:
+                logger.warning("Failed to init Qianfan reranker (%s), falling back to embedding similarity: %s", model_name, exc)
+        if not reranker:
+            reranker = _APIReranker(self.embedder, model_name=model_name)
+            logger.info("Initialized embedding similarity reranker model=%s", model_name)
+        return reranker
+
+    def _should_use_openai_reranker(self, model_name: str) -> bool:
+        if not (self.settings.openai_api_key and self.settings.openai_base_url):
+            return False
+        base = (self.settings.openai_base_url or "").lower()
+        if any(marker in base for marker in ("qianfan", "baidubce")):
+            return True
+        return "reranker" in model_name.lower()
+
+    def _should_use_qianfan_reranker(self, model_name: str) -> bool:
+        if not (self.settings.qianfan_access_key and self.settings.qianfan_secret_key):
+            return False
+        if getattr(self.settings, "use_qianfan", False):
+            return True
+        lowered = model_name.lower()
+        qianfan_markers = ("qwen", "ernie", "bce", "qianfan")
+        return any(marker in lowered for marker in qianfan_markers)
 
     def answer(self, query: str, top_k: Optional[int] = None, max_tokens: Optional[int] = None):
         start = time.time()

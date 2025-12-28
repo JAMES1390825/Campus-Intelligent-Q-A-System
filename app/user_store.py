@@ -72,7 +72,7 @@ class InMemoryUserStore:
 
 
 class UserStore:
-    def __init__(self, settings: Settings | None = None):
+    def __init__(self, settings: Optional[Settings] = None):
         self.settings = settings or get_settings()
         self._backend = "mysql"
         self.memory_store = InMemoryUserStore()

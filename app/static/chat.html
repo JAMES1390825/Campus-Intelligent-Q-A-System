@@ -7,21 +7,74 @@
 </head>
 <body>
   <div class="container">
-    <h1>校园信息智能问答（RAG）</h1>
-    <div class="subtitle">学生端 · 提问查询，自动引用索引文档。</div>
-
-    <div class="card">
-      <h3>提问</h3>
-      <textarea id="query" placeholder="输入你的问题，例如：请假申请需要哪些材料？"></textarea>
-      <div class="controls">
-        <label>Top-K: <input type="number" id="topk" value="4" min="1" max="10" style="width:60px;" /></label>
-        <label><input type="checkbox" id="needTool" checked /> 允许工具调用</label>
-        <label><input type="checkbox" id="streaming" /> 流式输出</label>
-        <button onclick="ask()">提问</button>
+    <div class="top-bar">
+      <div>
+        <h1>校园信息智能问答（RAG）</h1>
+        <div class="subtitle">学生端 · 支持多轮提问，点击引用可预览原文。</div>
+      </div>
+      <div class="user-menu">
+        <button class="user-menu-button" id="userMenuButton" type="button">
+          账号中心
+          <span aria-hidden="true">▾</span>
+        </button>
+        <div class="user-menu-dropdown" id="userMenuDropdown">
+          <button type="button" id="menuChangePwd">修改密码</button>
+          <button type="button" id="menuLogout">退出登录</button>
+        </div>
       </div>
     </div>
 
-    <div id="result"></div>
+    <div class="chat-layout">
+      <aside class="session-panel card">
+        <div class="session-panel-header">
+          <div>
+            <h3>历史会话</h3>
+            <p class="muted" style="margin:4px 0 0;">自动保存最近 50 条记录</p>
+          </div>
+          <button class="secondary small" onclick="startNewSession()">新会话</button>
+        </div>
+        <div id="sessionList" class="session-list">
+          <div class="session-placeholder">暂无会话</div>
+        </div>
+      </aside>
+
+      <div class="card chat-card">
+        <div class="chat-card-header">
+          <div>
+            <h3 id="sessionTitle">对话</h3>
+            <p class="muted" style="margin:4px 0 0;">Shift+Enter 换行，Enter 发送。</p>
+          </div>
+          <div class="session-controls">
+            <span class="badge" id="sessionBadge">会话 ID: --</span>
+            <button class="secondary" onclick="resetConversation()">清空上下文</button>
+          </div>
+        </div>
+
+        <div id="chatLog" class="chat-log">
+          <div class="chat-placeholder">开始对话吧～</div>
+        </div>
+        <div id="chatStatus" class="chat-status"></div>
+
+        <div class="composer">
+          <textarea id="chatInput" rows="2" placeholder="输入你的问题，例如：请假申请需要哪些材料？"></textarea>
+          <div class="composer-row">
+            <div class="composer-options">
+              <label class="option-inline">Top-K: <input type="number" id="topk" value="4" min="1" max="10" /></label>
+              <label class="option-inline"><input type="checkbox" id="needTool" checked /> 允许工具调用</label>
+              <label class="option-inline"><input type="checkbox" id="streaming" /> 流式输出</label>
+            </div>
+            <div class="composer-actions">
+              <button class="secondary" onclick="clearLocalHistory()">清空本地</button>
+              <button id="sendBtn" onclick="handleSendClick()">发送</button>
+            </div>
+          </div>
+          <div class="quick-prompts" id="quickPromptWrapper">
+            <span class="muted">快捷提问：</span>
+            <div id="quickPrompts" class="prompt-chips"></div>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 
   <!-- 首次登录修改密码弹窗 -->

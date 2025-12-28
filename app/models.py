@@ -62,13 +62,37 @@ class SessionMessage(BaseModel):
     created_at: float
 
 
+class SessionSummary(BaseModel):
+    session_id: str
+    title: str
+    last_message: Optional[str] = None
+    created_at: float
+    updated_at: float
+    message_count: int = 0
+
+
 class SessionHistoryResponse(BaseModel):
     session_id: str
+    title: Optional[str] = None
     history: List[SessionMessage]
+
+
+class SessionCreateRequest(BaseModel):
+    title: Optional[str] = None
 
 
 class SessionCreateResponse(BaseModel):
     session_id: str
+    title: str
+    created_at: float
+
+
+class SessionListResponse(BaseModel):
+    sessions: List[SessionSummary]
+
+
+class SessionUpdateRequest(BaseModel):
+    title: str
 
 
 class HealthStatus(BaseModel):

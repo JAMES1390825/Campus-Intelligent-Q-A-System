@@ -25,3 +25,5 @@ pymongo>=4.7.3
 pypdf>=3.17.4
 python-docx>=1.1.0
 openpyxl>=3.1.2
+oss2>=2.18.3
+redis>=5.0.1

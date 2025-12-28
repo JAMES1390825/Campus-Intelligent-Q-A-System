@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Any
+from typing import List, Any, Optional
 
 import faiss
 from langchain_community.docstore.in_memory import InMemoryDocstore
@@ -17,7 +17,7 @@ from .models import DocumentChunk
 
 
 class LangChainRAG:
-    def __init__(self, settings: Settings | None = None):
+    def __init__(self, settings: Optional[Settings] = None):
         self.settings = settings or get_settings()
         if not (self.settings.openai_api_key or self.settings.use_qianfan):
             raise RuntimeError("LangChain pipeline requires OpenAI-compatible key or Qianfan credentials")

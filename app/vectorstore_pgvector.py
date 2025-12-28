@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import json
-from typing import List, Tuple
+from typing import Any, List, Tuple, Optional
 import logging
 
 import numpy as np
+import numpy.typing as npt
 import psycopg2
 from psycopg2 import errors
-from pgvector.psycopg2 import register_vector
-from psycopg2.extras import execute_values
+from pgvector.psycopg2 import register_vector  # type: ignore[import]
+from psycopg2.extras import execute_values  # type: ignore[import-untyped]
 
 from .config import get_settings, Settings
 from .models import DocumentChunk, RetrievedChunk
@@ -18,8 +19,11 @@ from .embedding_provider import EmbeddingProvider
 logger = logging.getLogger(__name__)
 
 
+VectorArray = npt.NDArray[np.float32]
+
+
 class PGVectorStore:
-    def __init__(self, settings: Settings | None = None):
+    def __init__(self, settings: Optional[Settings] = None):
         self.settings = settings or get_settings()
         if not self.settings.pg_dsn:
             raise RuntimeError("PgVector enabled but CAMPUS_RAG_PG_DSN not configured")
@@ -49,13 +53,13 @@ class PGVectorStore:
             )
             conn.commit()
 
-    def _embed(self, texts: List[str]) -> np.ndarray:
+    def _embed(self, texts: List[str]) -> VectorArray:
         return self.embedder.embed(texts)
 
     def build(self, chunks: List[DocumentChunk]):
         if not chunks:
             return
-        embeddings = self._embed([c.text for c in chunks])
+        embeddings: VectorArray = self._embed([c.text for c in chunks])
         dim = embeddings.shape[1]
         self._ensure_schema(dim)
 
@@ -113,6 +117,7 @@ class PGVectorStore:
         hits: List[RetrievedChunk] = []
         for row in rows:
             chunk_id, document_id, source, source_type, metadata, content, distance = row
+            meta_obj: dict[str, Any]
             meta_obj = metadata or {}
             if isinstance(meta_obj, str):
                 try:
@@ -122,7 +127,7 @@ class PGVectorStore:
             chunk = DocumentChunk(
                 id=chunk_id,
                 text=content,
-                source=source,
+                source=source or document_id,
                 source_type=source_type or "file",
                 url=None,
                 metadata=meta_obj,
@@ -135,8 +140,10 @@ class PGVectorStore:
         try:
             with self._connect() as conn, conn.cursor() as cur:
                 cur.execute(f"SELECT COUNT(*) FROM {self.table}")
-                count = cur.fetchone()[0]
-            return int(count), int(count)
+                row = cur.fetchone()
+                count = row[0] if row else 0
+            total = int(count)
+            return total, total
         except errors.UndefinedTable:
             logger.warning("PgVector table '%s' missing; returning empty stats", self.table)
             return 0, 0
