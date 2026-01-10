@@ -1,0 +1,51 @@
+version: "3.9"
+
+services:
+  mongo:
+    image: mongo:6.0
+    container_name: aiagent-mongo
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+  redis:
+    image: redis:7-alpine
+    container_name: aiagent-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+  postgres:
+    image: ankane/pgvector:latest
+    container_name: aiagent-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: aiagent
+      POSTGRES_PASSWORD: campusrag2026
+      POSTGRES_DB: aiagent
+    ports:
+      - "15432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+  mysql:
+    image: mysql:8.0
+    container_name: aiagent-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: aiagent
+      MYSQL_DATABASE: aiagent
+      MYSQL_USER: aiagent
+      MYSQL_PASSWORD: aiagent
+    command: ["mysqld", "--default-authentication-plugin=mysql_native_password"]
+    ports:
+      - "13306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+
+volumes:
+  mongo_data:
+  pg_data:
+  mysql_data:

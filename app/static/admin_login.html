@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>管理员登录 · 校园信息问答</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="container">
+    <h1>管理员登录</h1>
+    <div class="subtitle">登录后进入管理页面进行文档上传和账号管理。</div>
+    <div class="card">
+      <h3>登录</h3>
+      <div class="row">
+        <input id="adminUsername" type="text" class="input" placeholder="管理员账号" value="admin" />
+        <input id="adminPassword" type="password" class="input" placeholder="管理员密码" />
+        <button onclick="login()">登录</button>
+        <span id="loginStatus" class="sources"></span>
+      </div>
+    </div>
+  </div>
+  <script src="/static/admin_login.js"></script>
+</body>
+</html>

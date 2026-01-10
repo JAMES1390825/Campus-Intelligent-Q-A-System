@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>校园信息问答 · 管理端</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="container">
+    <div class="top-bar">
+      <div>
+        <h1>管理端 · 知识库控制台</h1>
+        <div class="subtitle">维护文档、上传资料与调试问答</div>
+      </div>
+      <div class="user-menu">
+        <button class="user-menu-button" id="adminUserMenuButton" type="button">
+          管理员
+          <span aria-hidden="true">▾</span>
+        </button>
+        <div class="user-menu-dropdown" id="adminUserMenuDropdown">
+          <button type="button" id="adminMenuChangePwd">修改密码</button>
+          <button type="button" id="adminMenuLogout">退出登录</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="tab-shell">
+      <div class="tab-nav" role="tablist">
+        <button class="tab-button active" data-tab-target="tab-docs" type="button">文档概览</button>
+        <button class="tab-button" data-tab-target="tab-upload" type="button">上传文档</button>
+        <button class="tab-button" data-tab-target="tab-users" type="button">注册账号</button>
+        <button class="tab-button" data-tab-target="tab-debug" type="button">调试问答</button>
+      </div>
+
+      <div class="tab-panels">
+        <section id="tab-docs" class="tab-panel active" role="tabpanel">
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h3>知识库文件</h3>
+              </div>
+              <button class="secondary small" onclick="loadOverview()">刷新</button>
+            </div>
+            <div class="table-wrapper">
+              <table class="doc-table">
+                <thead>
+                  <tr>
+                    <th>名称</th>
+                    <th>大小</th>
+                    <th>更新时间</th>
+                    <th>状态</th>
+                    <th>指纹</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody id="docsTableBody">
+                  <tr><td colspan="6" class="sources">加载中...</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <div id="docsStatus" class="sources"></div>
+            <div id="overviewStatus" class="sources"></div>
+          </div>
+        </section>
+
+        <section id="tab-upload" class="tab-panel" role="tabpanel" aria-hidden="true">
+          <div class="card">
+            <h3>上传文档（支持 .txt/.md/.pdf/.docx/.xlsx）</h3>
+            <p class="sources">选择文件后点击上传，系统会自动完成切片与向量化。</p>
+            <div id="uploadGuardrails" class="sources"></div>
+            <div id="uploadHints" class="sources muted"></div>
+            <div class="upload-area">
+              <input type="file" id="fileInput" name="files" accept=".txt,.md,.pdf,.docx,.xlsx" />
+              <div class="controls" style="gap:10px; flex-wrap: wrap;">
+                <button id="uploadSubmitButton" onclick="uploadDoc()">上传</button>
+                <button type="button" class="ghost" onclick="resetFileSelection()">清空当前选择</button>
+              </div>
+              <div id="selectedFiles" class="sources muted">尚未选择文件</div>
+              <div class="divider" style="margin:12px 0;"></div>
+              <div>
+                <h4 class="section-title">上传与索引进度</h4>
+                <div id="uploadQueueList" class="queue-list muted">暂无文件</div>
+                <div id="uploadQueueSummary" class="sources" style="margin-top:6px;"></div>
+              </div>
+            </div>
+            <div id="uploadStatus" class="sources"></div>
+          </div>
+        </section>
+
+        <section id="tab-users" class="tab-panel" role="tabpanel" aria-hidden="true">
+          <div class="card">
+            <h3>注册学生账号</h3>
+            <p class="sources">系统默认初始密码为 <strong>hziee+学号</strong>，也可以手动指定。</p>
+            <div class="form-grid">
+              <label class="form-field">
+                <span>学号 / 用户名</span>
+                <input type="text" id="studentIdInput" class="input" placeholder="例如 20230101" />
+              </label>
+              <label class="form-field">
+                <span>自定义初始密码（可选）</span>
+                <input type="text" id="studentPasswordInput" class="input" placeholder="留空则自动生成" />
+              </label>
+            </div>
+            <div class="controls">
+              <button onclick="registerStudent()">创建账号</button>
+              <button type="button" class="ghost" onclick="resetRegisterForm()">清空</button>
+            </div>
+            <div id="registerStatus" class="sources"></div>
+          </div>
+        </section>
+
+        <section id="tab-debug" class="tab-panel" role="tabpanel" aria-hidden="true">
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h3>对话 / 检索调试</h3>
+                <p class="sources">直接调用 RAG 流程，便于排查答案与引用</p>
+              </div>
+            </div>
+            <textarea id="testerQuestion" placeholder="输入要测试的问题，例如：最新奖学金政策是什么？"></textarea>
+            <div class="controls">
+              <button onclick="runTestQuery()">运行调试</button>
+            </div>
+            <div id="testerStatus" class="sources"></div>
+            <div id="testerResult" class="query-result hidden">
+              <div class="query-answer" id="testerAnswer"></div>
+              <div class="query-sources">
+                <div class="label">引用片段</div>
+                <div id="testerSources" class="query-sources-list"></div>
+              </div>
+            </div>
+          </div>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <!-- 首次登录修改密码弹窗 -->
+  <div id="pwdModal" class="modal hidden">
+    <div class="modal-backdrop" onclick="closePwdModal()"></div>
+    <div class="modal-content">
+      <h3>首次登录请修改密码</h3>
+      <p class="muted">为保障管理账号安全，请设置新的密码后再继续操作。</p>
+      <input type="password" id="newPassword" class="input" placeholder="新密码（至少6位）" style="width:100%; margin-top:10px;" />
+      <input type="password" id="confirmPassword" class="input" placeholder="确认新密码" style="width:100%; margin-top:10px;" />
+      <div id="pwdStatus" class="sources" style="margin-top:8px;"></div>
+      <div class="modal-actions">
+        <button class="secondary" onclick="closePwdModal()">取消</button>
+        <button onclick="changePassword()">确定修改</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/admin.js?v=20260111"></script>
+</body>
+</html>
